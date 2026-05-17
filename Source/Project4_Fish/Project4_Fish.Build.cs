@@ -10,11 +10,13 @@ public class Project4_Fish : ModuleRules
 	
 		PublicDependencyModuleNames.AddRange(new string[] {    
 			"Core",
-    "CoreUObject",
-    "Engine",
-    "InputCore",
-    "Sockets",
-    "Networking" 
+			"CoreUObject",
+			"Engine",
+			"InputCore",
+
+			// ローカル通信用にIPv4を取得するモジュールを追加
+			"Sockets",
+			"Networking" 
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] {  });
