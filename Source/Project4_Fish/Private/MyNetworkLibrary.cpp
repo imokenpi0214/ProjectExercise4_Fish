@@ -6,7 +6,7 @@
 #include "Sockets.h"
 #include "SocketSubsystem.h"
 
-// ローカルIpv4アドレスを取得。
+// ローカルIpv4アドレスを取得(BPからどこからでも呼び出し可能)
 FString UMyNetworkLibrary::GetLocalIPv4()
 {
     bool bCanBind = false;
