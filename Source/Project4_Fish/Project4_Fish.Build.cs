@@ -8,7 +8,7 @@ public class Project4_Fish : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 	
-		PublicDependencyModuleNames.AddRange(new string[] {    
+		PublicDependencyModuleNames.AddRange(new string[] {
 			"Core",
 			"CoreUObject",
 			"Engine",
@@ -16,7 +16,10 @@ public class Project4_Fish : ModuleRules
 
 			// ローカル通信用にIPv4を取得するモジュールを追加
 			"Sockets",
-			"Networking" 
+			"Networking"
+
+			"OnlineSubsystem",
+			"OnlineSubsystemUtils"
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] {  });
