@@ -16,10 +16,10 @@ public class Project4_Fish : ModuleRules
 
 			// ローカル通信用にIPv4を取得するモジュールを追加
 			"Sockets",
-			"Networking"
+			"Networking",
 
 			"OnlineSubsystem",
-			"OnlineSubsystemUtils"
+			"OnlineSubsystemUtils",
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] {  });
