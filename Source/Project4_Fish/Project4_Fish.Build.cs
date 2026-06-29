@@ -13,8 +13,10 @@ public class Project4_Fish : ModuleRules
 			"CoreUObject",
 			"Engine",
 			"InputCore",
+			"AIModule",
+			"NavigationSystem",
 
-			// ƒ[ƒJƒ‹’ÊM—p‚ÉIPv4‚ğæ“¾‚·‚éƒ‚ƒWƒ…[ƒ‹‚ğ’Ç‰Á
+			// ï¿½ï¿½ï¿½[ï¿½Jï¿½ï¿½ï¿½ÊMï¿½pï¿½ï¿½IPv4ï¿½ï¿½ï¿½æ“¾ï¿½ï¿½ï¿½éƒ‚ï¿½Wï¿½ï¿½ï¿½[ï¿½ï¿½ï¿½ï¿½Ç‰ï¿½
 			"Sockets",
 			"Networking",
 
