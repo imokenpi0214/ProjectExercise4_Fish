@@ -11,17 +11,20 @@ class AAIController;
  * 敵AIの「脳」になるコンポーネント。
  *
  * BP_Enemy に追加して使用する。
+ *
  * 役割：
  * - AIモード管理
  * - ランダム遊泳
  * - Aルール移動
  * - 出現時モード
- * - 今後、貪る / 攻撃 / 逃走 / 釣られに行くモードもここに追加していく
+ * - 貪るモード
+ * - 今後、攻撃 / 逃走 / 釣られに行くモードもここに追加していく
  *
- * 注意：
- * - 実際に移動するPawnは BP_Enemy
- * - AIController は MoveToLocation を担当
- * - このComponentは「どこへ行くか」「どのモードにするか」を判断する
+ * 基本方針：
+ * - BP_Enemy は BP_PlayerBase の子として作る
+ * - この C++ Component が「どこへ行くか」「どのモードにするか」を判断する
+ * - 実際の移動命令は AIController の MoveToLocation を使う
+ * - BP側からは BlueprintCallable 関数でこのComponentへ指示を出す
  */
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
 class PROJECT4_FISH_API UEnemyAIBrainComponent : public UActorComponent
@@ -43,11 +46,58 @@ public:
 
 public:
     // =========================
+    // BPから呼ぶ公開関数
+    // =========================
+
+    /**
+     * AIモードを変更する関数。
+     *
+     * BPからCurrentModeを直接Setするより、
+     * この関数を通した方が後からEnter処理を追加しやすい。
+     *
+     * 例：
+     * - Wanderにする
+     * - SpawnMoveにする
+     * - Devourにする
+     */
+    UFUNCTION(BlueprintCallable, Category="AI|Mode")
+    void SetAIMode(EEnemyAIMode NewMode);
+
+    /**
+     * BP_CollectItemGroupなど、プランクトン群れActorをAIに渡す関数。
+     *
+     * BP_EnemyのAI_CheckCollectItemGroupから呼ぶ想定。
+     *
+     * 処理内容：
+     * - TargetGroupActor に保存
+     * - TargetLocation に群れ中央の座標を設定
+     * - CurrentMode を SpawnMove に変更
+     */
+    UFUNCTION(BlueprintCallable, Category="AI|Target")
+    void SetCollectItemGroupTarget(AActor* NewGroupActor);
+
+    /**
+     * AIがプランクトンを1つ取得した時に呼ぶ関数。
+     *
+     * 狙っていたプランクトンかどうかに関係なく呼ぶ。
+     * 理由：
+     * - 狙ったプランクトンに向かう途中で別のプランクトンを拾うことがあるため。
+     *
+     * 今後の処理：
+     * - EatenPlanktonCount++
+     * - 20%でAttack判定
+     * - 食べた数でGoToHook判定
+     */
+    UFUNCTION(BlueprintCallable, Category="AI|Collect")
+    void NotifyPlanktonCollected();
+
+public:
+    // =========================
     // 基本AI設定
     // =========================
 
     // 現在のAIモード。
-    // 例：Wanderならランダム遊泳、SpawnMoveなら目的地へ向かう。
+    // 例：Wanderなら自由移動、SpawnMoveなら群れ中央へ移動、Devourならプランクトンを食べる。
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AI")
     EEnemyAIMode CurrentMode = EEnemyAIMode::Wander;
 
@@ -131,8 +181,11 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AI|ARule")
     FName FishTagName = "Fish";
 
-    // 今後、プランクトン集積地・釣り糸・逃走先などの目的地を入れるための変数。
-    // SpawnMoveでは、この位置へAルールで向かう。
+    // 現在の目的地。
+    // SpawnMoveではプランクトン群れ中央。
+    // Devourでは狙っているプランクトン位置。
+    // GoToHookでは釣り糸位置。
+    // Fleeでは逃走先。
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AI|Target")
     FVector TargetLocation = FVector::ZeroVector;
 
@@ -142,16 +195,50 @@ public:
 
     // SpawnMove中、攻撃モードへ移行する確率。
     // 0.03 = 3%
-    // Attackが未実装の間は、いったんWanderへ逃がす予定。
+    // Attackが未実装の間は0.0にしておくのがおすすめ。
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AI|SpawnMove")
     float SpawnMoveAttackChance = 0.03f;
 
     // TargetLocationへ到着したと判断する距離。
-    // この距離以内に入ったら「目的地に着いた」と扱う。
+    // SpawnMoveでは、群れ中央にこの距離以内まで近づいたらDevourへ移行する。
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AI|SpawnMove")
     float TargetReachedDistance = 150.0f;
 
+    // =========================
+    // 貪るモード / Devour
+    // =========================
+
+    // プランクトンActorを探すためのタグ。
+    // 実際のプランクトンBPに Plankton タグを付ける想定。
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AI|Devour")
+    FName PlanktonTagName = "Plankton";
+
+    // Devour中にプランクトンを探す範囲。
+    // この範囲内にプランクトンが無ければ、周囲のプランクトンが消えた扱いにする。
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AI|Devour")
+    float DevourSearchRadius = 1200.0f;
+
+    // 狙っているプランクトンへ到着したと判断する距離。
+    // 実際の取得処理はOverlap側で行われる想定なので、
+    // ここでは「近くまで向かう」判断に使う。
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AI|Devour")
+    float PlanktonReachedDistance = 100.0f;
+
+    // プランクトンを取得した時、Attackへ移行する確率。
+    // 0.20 = 20%
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AI|Devour")
+    float DevourAttackChance = 0.20f;
+
+    // 食べたプランクトン数。
+    // 狙っていたプランクトン以外を拾っても加算する。
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="AI|Devour")
+    int32 EatenPlanktonCount = 0;
+
 private:
+    // =========================
+    // 内部参照
+    // =========================
+
     // このコンポーネントを持っているPawn。
     // 基本的には BP_Enemy。
     UPROPERTY()
@@ -161,6 +248,16 @@ private:
     // MoveToLocationやStopMovementに使う。
     UPROPERTY()
     AAIController* OwnerAIController = nullptr;
+
+    // 現在向かっているプランクトン群れActor。
+    // BP_CollectItemGroup が入る想定。
+    UPROPERTY()
+    AActor* TargetGroupActor = nullptr;
+
+    // 現在狙っているプランクトンActor。
+    // Devour中に使う。
+    UPROPERTY()
+    AActor* TargetPlanktonActor = nullptr;
 
     // 次にAI判断をする時刻。
     // 毎フレーム判断すると重くなるので、一定間隔で判断する。
@@ -176,8 +273,15 @@ private:
     void TickWander(float DeltaTime);
 
     // SpawnMoveモードの毎回処理。
-    // TargetLocationへAルールで向かう。
+    // TargetLocation、つまりプランクトン群れ中央へAルールで向かう。
+    // 到着したらDevourへ移行する。
     void TickSpawnMove(float DeltaTime);
+
+    // Devourモードの毎回処理。
+    // 周囲のプランクトンを探し、狙ったプランクトンへ向かう。
+    // 狙っていたプランクトンが消えたら別のプランクトンを探す。
+    // 周囲にプランクトンが無ければAttackへ移行する予定。
+    void TickDevour(float DeltaTime);
 
     // =========================
     // Wander用関数
@@ -187,12 +291,42 @@ private:
     // 現在はAルールを通して少し補正してから移動する。
     bool MoveToRandomLocation();
 
-    // 次の判断時間になっているか確認する。
-    bool ShouldMakeDecision() const;
+    // =========================
+    // SpawnMove / Target用関数
+    // =========================
 
-    // 次の判断時間を設定する。
-    // MinTime〜MaxTimeの間でランダムに待つ。
-    void SetNextDecisionTime(float MinTime, float MaxTime);
+    // 現在位置がTargetLocationに十分近いか判定する。
+    bool IsNearTargetLocation() const;
+
+    // =========================
+    // Devour用関数
+    // =========================
+
+    // 周囲のプランクトンから一番近いものを探す。
+    // 見つからなければnullptrを返す。
+    AActor* FindNearestPlankton() const;
+
+    // TargetPlanktonActorがまだ有効か確認する。
+    bool IsTargetPlanktonValid() const;
+
+    // TargetPlanktonActorに十分近いか確認する。
+    bool IsNearTargetPlankton() const;
+
+    // TargetPlanktonActorを近くのプランクトンに更新する。
+    // 見つかったらtrue、見つからなければfalse。
+    bool SelectNearestPlankton();
+
+    // 食べた数に応じてGoToHookへ行くか判定する。
+    // GoToHook未実装の間は仮でWanderなどに逃がす予定。
+    bool TryGoToHookByPlanktonCount();
+
+    // 食べた数からGoToHook確率を返す。
+    // 40以上：100%
+    // 30以上：50%
+    // 20以上：25%
+    // 10以上：12.5%
+    // それ未満：0%
+    float GetGoToHookChanceByPlanktonCount() const;
 
     // =========================
     // Aルール関数
@@ -208,11 +342,15 @@ private:
     bool MoveByARuleToLocation(const FVector& GoalLocation);
 
     // =========================
-    // 汎用判定関数
+    // 汎用関数
     // =========================
 
-    // 現在位置がTargetLocationに十分近いか判定する。
-    bool IsNearTargetLocation() const;
+    // 次の判断時間になっているか確認する。
+    bool ShouldMakeDecision() const;
+
+    // 次の判断時間を設定する。
+    // MinTime〜MaxTimeの間でランダムに待つ。
+    void SetNextDecisionTime(float MinTime, float MaxTime);
 
     // 確率判定。
     // Chance = 0.03 なら3%でtrue。

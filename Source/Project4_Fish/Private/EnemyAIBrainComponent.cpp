@@ -11,9 +11,10 @@
  * 敵AIの判断を担当するコンポーネント。
  *
  * 現在できること：
- * - Wanderモード：ランダム移動
+ * - Wanderモード：自由移動
+ * - SpawnMoveモード：プランクトン群れ中央へ移動
+ * - Devourモード：周囲のプランクトンを探して向かう
  * - Aルール移動：目的地へ向かいつつ、Fishタグ持ちActorから距離を取る
- * - SpawnMoveモード：TargetLocationへ向かう
  *
  * 注意：
  * - AI判断はサーバー側のみで行う
@@ -82,15 +83,169 @@ void UEnemyAIBrainComponent::TickComponent(
         TickSpawnMove(DeltaTime);
         break;
 
+    case EEnemyAIMode::Devour:
+        TickDevour(DeltaTime);
+        break;
+
     case EEnemyAIMode::Wander:
         TickWander(DeltaTime);
         break;
 
+    case EEnemyAIMode::Attack:
+        // TODO: Attackモード実装後に TickAttack を呼ぶ
+        break;
+
+    case EEnemyAIMode::GoToHook:
+        // TODO: GoToHookモード実装後に TickGoToHook を呼ぶ
+        break;
+
+    case EEnemyAIMode::Flee:
+        // TODO: Fleeモード実装後に TickFlee を呼ぶ
+        break;
+
     default:
-        // まだ未実装のモードは何もしない
         break;
     }
 }
+
+// =========================
+// BPから呼ぶ公開関数
+// =========================
+
+/**
+ * AIモードを変更する。
+ *
+ * BPからCurrentModeを直接Setする代わりに、この関数を使う。
+ * 後で「モードに入った瞬間の処理」を追加しやすくするため。
+ */
+void UEnemyAIBrainComponent::SetAIMode(EEnemyAIMode NewMode)
+{
+    if (CurrentMode == NewMode)
+    {
+        return;
+    }
+
+    CurrentMode = NewMode;
+
+    // モード変更直後は早めに判断させる
+    SetNextDecisionTime(0.05f, 0.15f);
+
+    // モード別の初期化
+    switch (CurrentMode)
+    {
+    case EEnemyAIMode::Wander:
+        TargetPlanktonActor = nullptr;
+        break;
+
+    case EEnemyAIMode::SpawnMove:
+        TargetPlanktonActor = nullptr;
+        break;
+
+    case EEnemyAIMode::Devour:
+        // Devourに入ったら、まず狙うプランクトンを探す
+        SelectNearestPlankton();
+        break;
+
+    case EEnemyAIMode::Attack:
+        // TODO: Attack実装時に初期化処理を追加
+        if (OwnerAIController)
+        {
+            OwnerAIController->StopMovement();
+        }
+        break;
+
+    case EEnemyAIMode::GoToHook:
+        // TODO: GoToHook実装時に釣り糸位置をTargetLocationへ入れる
+        if (OwnerAIController)
+        {
+            OwnerAIController->StopMovement();
+        }
+        break;
+
+    case EEnemyAIMode::Flee:
+        // TODO: Flee実装時に逃走先を設定する
+        break;
+
+    default:
+        break;
+    }
+}
+
+/**
+ * BP_Enemy側から、GameSystemで取得したプランクトン群れActorを渡す。
+ *
+ * 想定：
+ * - BP_EnemyのAI_CheckCollectItemGroupで、
+ *   GameSystemからBP_CollectItemGroupを取得する
+ * - そのActorをこの関数へ渡す
+ *
+ * この関数内で：
+ * - TargetGroupActorに保存
+ * - TargetLocationに群れ中央位置を保存
+ * - SpawnMoveへ移行
+ */
+void UEnemyAIBrainComponent::SetCollectItemGroupTarget(AActor* NewGroupActor)
+{
+    if (!NewGroupActor)
+    {
+        return;
+    }
+
+    AActor* OwnerActor = GetOwner();
+    if (!OwnerActor || !OwnerActor->HasAuthority())
+    {
+        return;
+    }
+
+    TargetGroupActor = NewGroupActor;
+    TargetLocation = NewGroupActor->GetActorLocation();
+
+    SetAIMode(EEnemyAIMode::SpawnMove);
+}
+
+/**
+ * AIがプランクトンを1つ取得した時に呼ぶ。
+ *
+ * 狙っていたプランクトンかどうかに関係なく呼ぶ。
+ * 理由：
+ * - 狙ったプランクトンへ向かう途中で、別のプランクトンを拾うことがあるため。
+ */
+void UEnemyAIBrainComponent::NotifyPlanktonCollected()
+{
+    AActor* OwnerActor = GetOwner();
+    if (!OwnerActor || !OwnerActor->HasAuthority())
+    {
+        return;
+    }
+
+    EatenPlanktonCount++;
+
+    // プランクトン取得時、常に20%でAttackへ移行
+    if (TryChance(DevourAttackChance))
+    {
+        // TODO: Attackモード実装後、ここで攻撃対象を設定する
+        SetAIMode(EEnemyAIMode::Attack);
+        return;
+    }
+
+    // 食べた数によってGoToHookへ移行するか判定
+    // if (TryGoToHookByPlanktonCount())
+    // {
+    //     // TODO: GoToHookモード実装後、ここで釣り糸位置を設定する
+    //     SetAIMode(EEnemyAIMode::GoToHook);
+    //     return;
+    // }
+
+    // それ以外はDevour継続
+    if (CurrentMode == EEnemyAIMode::SpawnMove)
+    {
+        SetAIMode(EEnemyAIMode::Devour);
+    }
+}
+
+// =========================
+// モード別Tick
+// =========================
 
 /**
  * Wanderモード。
@@ -99,8 +254,8 @@ void UEnemyAIBrainComponent::TickComponent(
  * - 30%でその場に停止
  * - 70%でランダムなNavMesh地点へ移動
  *
- * 現在の移動はAルールを通しているため、
- * ランダム地点へ向かいつつ、近くの魚を軽く避ける。
+ * プランクトン群れの検知はBP_Enemy側のTimerで行う。
+ * Wander中に群れが見つかった場合のみ、BP側からSetCollectItemGroupTargetを呼ぶ。
  */
 void UEnemyAIBrainComponent::TickWander(float DeltaTime)
 {
@@ -142,10 +297,9 @@ void UEnemyAIBrainComponent::TickWander(float DeltaTime)
  * SpawnMoveモード。
  *
  * 仕様：
- * - TargetLocationへAルールで向かう
- * - 3%でAttackへ行く可能性がある
- * - ただしAttack未実装のため、今はWanderへ逃がす
- * - TargetLocationへ到着したらWanderへ戻る
+ * - プランクトン群れ中央へAルールで向かう
+ * - 群れ中央へ大体近づいたらDevourへ移行する
+ * - Devourへ行けるのはこのSpawnMoveからのみ
  */
 void UEnemyAIBrainComponent::TickSpawnMove(float DeltaTime)
 {
@@ -155,27 +309,30 @@ void UEnemyAIBrainComponent::TickSpawnMove(float DeltaTime)
         return;
     }
 
-    // 3%で攻撃モードへ移行する想定
-    // ただしAttackはまだ未実装なので、今はWanderへ移行させる
+    // 群れActorが有効なら、群れ中央位置を更新する
+    // 群れActorが移動したり、位置が変わる可能性への保険
+    if (TargetGroupActor)
+    {
+        TargetLocation = TargetGroupActor->GetActorLocation();
+    }
+
+    // 出現時モード中、3%でAttackへ移行する仕様
+    // Attack未実装なら、BP側でSpawnMoveAttackChanceを0.0にしておくのがおすすめ
     if (TryChance(SpawnMoveAttackChance))
     {
-        // 後でAttack実装後にこう変える：
-        // CurrentMode = EEnemyAIMode::Attack;
-
-        CurrentMode = EEnemyAIMode::Wander;
-        SetNextDecisionTime(0.5f, 1.0f);
+        // TODO: Attackモード実装後、攻撃対象を設定する
+        SetAIMode(EEnemyAIMode::Attack);
         return;
     }
 
-    // TargetLocationに近づいたら到着扱い
+    // 群れ中央にだいたい近づいたらDevourへ移行
     if (IsNearTargetLocation())
     {
-        CurrentMode = EEnemyAIMode::Wander;
-        SetNextDecisionTime(0.5f, 1.0f);
+        SetAIMode(EEnemyAIMode::Devour);
         return;
     }
 
-    // TargetLocationへAルールで向かう
+    // 群れ中央へAルールで向かう
     const bool bMoved = MoveByARuleToLocation(TargetLocation);
 
     if (bMoved)
@@ -185,15 +342,75 @@ void UEnemyAIBrainComponent::TickSpawnMove(float DeltaTime)
     }
     else
     {
-        // 目的地へ移動できなかった場合はWanderへ戻す
-        CurrentMode = EEnemyAIMode::Wander;
+        // 目的地へ移動できなかった場合は少し待って再試行
+        // DevourやWanderへは勝手に移行しない
         SetNextDecisionTime(0.5f, 1.0f);
     }
 }
 
 /**
- * Wander用。
+ * Devourモード。
  *
+ * 仕様：
+ * - 周囲のプランクトンを探す
+ * - 一番近いプランクトンへAルールで向かう
+ * - 狙っていたプランクトンが消えたら別のプランクトンを探す
+ * - 周囲のプランクトンが全て消えたらAttackへ強制移行
+ * - DevourからWanderへは戻らない
+ */
+void UEnemyAIBrainComponent::TickDevour(float DeltaTime)
+{
+    // 判断タイミングでなければ何もしない
+    if (!ShouldMakeDecision())
+    {
+        return;
+    }
+
+    // 狙っているプランクトンが無効なら、近くの別プランクトンを探す
+    if (!IsTargetPlanktonValid())
+    {
+        const bool bFound = SelectNearestPlankton();
+
+        if (!bFound)
+        {
+            // 周囲のプランクトンが全て消えた扱い
+            // 仕様：強制的にAttackへ移行
+            SetAIMode(EEnemyAIMode::Attack);
+            return;
+        }
+    }
+
+    // ここでもう一度確認
+    if (!IsTargetPlanktonValid())
+    {
+        SetAIMode(EEnemyAIMode::Attack);
+        return;
+    }
+
+    // 狙っているプランクトンの現在位置を目的地にする
+    TargetLocation = TargetPlanktonActor->GetActorLocation();
+
+    // 狙ったプランクトンへAルールで向かう
+    const bool bMoved = MoveByARuleToLocation(TargetLocation);
+
+    if (bMoved)
+    {
+        // Devour中はやや短い間隔で進路更新する
+        SetNextDecisionTime(0.15f, 0.35f);
+    }
+    else
+    {
+        // 移動できないなら別のプランクトンを探す
+        TargetPlanktonActor = nullptr;
+        SetNextDecisionTime(0.1f, 0.2f);
+    }
+}
+
+// =========================
+// Wander用関数
+// =========================
+
+/**
  * NavMesh上のランダム地点を探し、
  * その地点を目的地としてAルールで移動する。
  */
@@ -228,9 +445,164 @@ bool UEnemyAIBrainComponent::MoveToRandomLocation()
     return MoveByARuleToLocation(RandomLocation.Location);
 }
 
+// =========================
+// Devour用関数
+// =========================
+
 /**
- * Aルール用。
+ * 周囲のプランクトンから一番近いものを探す。
  *
+ * 今は簡易版としてタグ検索を使用。
+ * 実際のプランクトンBPに Plankton タグを付ける必要がある。
+ */
+AActor* UEnemyAIBrainComponent::FindNearestPlankton() const
+{
+    if (!OwnerPawn)
+    {
+        return nullptr;
+    }
+
+    TArray<AActor*> PlanktonActors;
+    UGameplayStatics::GetAllActorsWithTag(GetWorld(), PlanktonTagName, PlanktonActors);
+
+    const FVector MyLocation = OwnerPawn->GetActorLocation();
+
+    AActor* NearestPlankton = nullptr;
+    float NearestDistanceSq = TNumericLimits<float>::Max();
+
+    const float SearchRadiusSq = DevourSearchRadius * DevourSearchRadius;
+
+    for (AActor* PlanktonActor : PlanktonActors)
+    {
+        if (!PlanktonActor)
+        {
+            continue;
+        }
+
+        const float DistanceSq = FVector::DistSquared2D(
+            MyLocation,
+            PlanktonActor->GetActorLocation()
+        );
+
+        // 探索範囲外は無視
+        if (DistanceSq > SearchRadiusSq)
+        {
+            continue;
+        }
+
+        if (DistanceSq < NearestDistanceSq)
+        {
+            NearestDistanceSq = DistanceSq;
+            NearestPlankton = PlanktonActor;
+        }
+    }
+
+    return NearestPlankton;
+}
+
+/**
+ * TargetPlanktonActorがまだ有効か確認する。
+ *
+ * 狙っていたプランクトンが他の魚に食べられて消えた場合、
+ * falseになる想定。
+ */
+bool UEnemyAIBrainComponent::IsTargetPlanktonValid() const
+{
+    return IsValid(TargetPlanktonActor);
+}
+
+/**
+ * TargetPlanktonActorに十分近いか確認する。
+ *
+ * 実際の取得はOverlap側で行われる想定。
+ * この関数は現在は保険・今後の拡張用。
+ */
+bool UEnemyAIBrainComponent::IsNearTargetPlankton() const
+{
+    if (!OwnerPawn || !IsTargetPlanktonValid())
+    {
+        return false;
+    }
+
+    const float Distance = FVector::Dist2D(
+        OwnerPawn->GetActorLocation(),
+        TargetPlanktonActor->GetActorLocation()
+    );
+
+    return Distance <= PlanktonReachedDistance;
+}
+
+/**
+ * 周囲のプランクトンから一番近いものを選んでTargetPlanktonActorに入れる。
+ */
+bool UEnemyAIBrainComponent::SelectNearestPlankton()
+{
+    TargetPlanktonActor = FindNearestPlankton();
+
+    if (!TargetPlanktonActor)
+    {
+        return false;
+    }
+
+    TargetLocation = TargetPlanktonActor->GetActorLocation();
+    return true;
+}
+
+/**
+ * 食べた数に応じてGoToHookへ移行するか判定する。
+ */
+bool UEnemyAIBrainComponent::TryGoToHookByPlanktonCount()
+{
+    const float Chance = GetGoToHookChanceByPlanktonCount();
+
+    if (Chance <= 0.0f)
+    {
+        return false;
+    }
+
+    return TryChance(Chance);
+}
+
+/**
+ * 食べた数からGoToHook確率を返す。
+ *
+ * 仕様：
+ * - 40個以上：100%
+ * - 30個以上：50%
+ * - 20個以上：25%
+ * - 10個以上：12.5%
+ * - それ未満：0%
+ */
+float UEnemyAIBrainComponent::GetGoToHookChanceByPlanktonCount() const
+{
+    if (EatenPlanktonCount >= 40)
+    {
+        return 1.0f;
+    }
+
+    if (EatenPlanktonCount >= 30)
+    {
+        return 0.5f;
+    }
+
+    if (EatenPlanktonCount >= 20)
+    {
+        return 0.25f;
+    }
+
+    if (EatenPlanktonCount >= 10)
+    {
+        return 0.125f;
+    }
+
+    return 0.0f;
+}
+
+// =========================
+// Aルール関数
+// =========================
+
+/**
  * 近くにいるFishタグ持ちActorから離れる方向を計算する。
  *
  * 今は簡易版として、
@@ -301,8 +673,6 @@ FVector UEnemyAIBrainComponent::CalculateAvoidDirection() const
 }
 
 /**
- * Aルール用。
- *
  * 目的地へ向かう方向、魚を避ける方向、ランダム方向を合成して、
  * 実際にMoveToする候補地点を作る。
  */
@@ -404,6 +774,10 @@ bool UEnemyAIBrainComponent::MoveByARuleToLocation(const FVector& GoalLocation)
 
     return true;
 }
+
+// =========================
+// 汎用関数
+// =========================
 
 /**
  * TargetLocationに十分近いか判定する。
