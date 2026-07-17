@@ -6,68 +6,181 @@
 #include "GameFramework/Pawn.h"
 #include "Kismet/GameplayStatics.h"
 
+
 /**
  * EnemyAIBrainComponent
  *
  * 敵AIの判断を担当するコンポーネント。
  *
- * 現在できること：
- * - Wanderモード：自由移動
- * - Wander中、3セル以内にFishタグActorがいたらAttackへ移行
- * - BeginPlay直後、一定時間Attackへ移行しない
- * - リスポーン後 / ゴール後にBPからAttackLockを付与できる
- * - SafeZoneタグ持ちActorを攻撃対象から除外
- * - SpawnMoveモード：プランクトン群れ中央へ移動
- * - Devourモード：周囲のプランクトンを探して向かう
- * - Attackモード：対象へ接近し、EnemyAIAttackComponentへ突進攻撃を命令する
- * - 攻撃ヒット後、自身HP80%以上ならAttack継続
- * - 攻撃ヒット後、自身HP80%未満ならWanderへ戻る
- * - 被弾時、HP割合と確率でFleeへ移行
- * - Fleeモード：攻撃してきた相手からAルールで逃げる
- * - Flee中、12セルほど離れたらWanderへ戻る
- * - Aルール移動：目的地へ向かいつつ、Fishタグ持ちActorから距離を取る
  *
- * 注意：
- * - AI判断はサーバー側のみで行う
- * - 実際の通常移動命令はAIControllerのMoveToLocationで行う
- * - 突進攻撃はEnemyAIAttackComponentが担当する
- * - BP_EnemyはBP_PlayerBaseの子として使う想定
+ * =========================================================
+ * 現在のAIモード
+ * =========================================================
+ *
+ * - Wander
+ *   自由遊泳。
+ *
+ *   通常時は近距離のFishタグActorを検知すると
+ *   Attackへ移行する。
+ *
+ *   一定数以上のプランクトンを持っている場合は
+ *   GoToHookへ移行する。
+ *
+ *   GoToHookへ行きたいが、
+ *   現在アクティブなGoal Pointが存在しない場合は、
+ *
+ *   bWaitingForHook = true
+ *
+ *   の状態で一時的にWanderへ戻る。
+ *
+ *   その後、
+ *   HookSearchIntervalMin ～ HookSearchIntervalMax
+ *   の間隔でBP側へ検索要求を送る。
+ *
+ *
+ * - SpawnMove
+ *   プランクトン群れ中央へAルールで向かう。
+ *
+ *
+ * - Devour
+ *   周囲のプランクトンを探して貪る。
+ *
+ *
+ * - Attack
+ *   攻撃対象へ接近し、
+ *   EnemyAIAttackComponentへ突進攻撃を命令する。
+ *
+ *
+ * - Flee
+ *   直前に自分を攻撃した相手からAルールで逃げる。
+ *
+ *
+ * - GoToHook
+ *   GameSystemの
+ *   Get Active Nearby Goal Point
+ *   が返した現在アクティブなGoal Pointへ
+ *   Aルールで向かう。
+ *
+ *
+ * =========================================================
+ * アクティブGoal Point取得方法
+ * =========================================================
+ *
+ * C++側
+ * ↓
+ * OnHookSearchRequested.Broadcast()
+ * ↓
+ * BP_Enemy
+ * ↓
+ * GameSystem
+ * ↓
+ * Get Active Nearby Goal Point
+ * ↓
+ * 有効Actor取得
+ * ↓
+ * SetHookTarget(Actor)
+ * ↓
+ * C++側でTargetHookActorへ保存
+ *
+ *
+ * =========================================================
+ * GoToHook中のAttack
+ * =========================================================
+ *
+ * 周囲に魚が接近した場合のみ、
+ * Attack移行判定を行う。
+ *
+ * Goal Pointから12セル以上：
+ * → 最大30%
+ *
+ * 12～4セル：
+ * → 近づくほど30%から0%へ低下
+ *
+ * 4セル以内：
+ * → 0%
+ *
+ *
+ * GoToHook
+ * ↓
+ * Attack
+ * ↓
+ * Attack終了
+ * ↓
+ * GoToHookへ復帰
+ *
+ *
+ * =========================================================
+ * 注意
+ * =========================================================
+ *
+ * - AI判断はサーバー側のみ行う。
+ *
+ * - 通常移動はAIControllerのMoveToLocationを使用する。
+ *
+ * - 突進攻撃はEnemyAIAttackComponentが担当する。
+ *
+ * - GameSystemのBP専用関数はC++から直接呼ばない。
+ *
+ * - OnHookSearchRequestedをBP_Enemy側でBindする必要がある。
  */
+
+
+// =========================================================
+// Constructor
+// =========================================================
 
 UEnemyAIBrainComponent::UEnemyAIBrainComponent()
 {
-    // TickComponentを使うためにtrueにする
+    // TickComponentを使用する。
     PrimaryComponentTick.bCanEverTick = true;
 }
+
+
+// =========================================================
+// BeginPlay
+// =========================================================
 
 void UEnemyAIBrainComponent::BeginPlay()
 {
     Super::BeginPlay();
 
-    // このコンポーネントを持っているPawnを取得する
-    // 基本的にはBP_Enemyが入る想定
+
+    // このComponentを持つPawnを取得する。
+    // 基本的にはBP_Enemy。
     OwnerPawn = Cast<APawn>(GetOwner());
 
-    // Pawnを操作しているAIControllerを取得する
+
+    // AIControllerを取得する。
     if (OwnerPawn)
     {
-        OwnerAIController = Cast<AAIController>(OwnerPawn->GetController());
+        OwnerAIController =
+            Cast<AAIController>(OwnerPawn->GetController());
     }
 
-    // AI専用攻撃コンポーネントを取得する
-    // BP_EnemyにEnemyAIAttackComponentを追加しておく必要がある
+
+    // AI専用AttackComponentを取得する。
     AIAttackComponent = GetOwner()
         ? GetOwner()->FindComponentByClass<UEnemyAIAttackComponent>()
         : nullptr;
 
-    // 最初の判断タイミングを少しランダムにずらす
-    // 14体が同時に判断して一斉に動くのを避けるため
+
+    // 全AIが完全に同時に判断しないように、
+    // 初回判断タイミングを少しランダムにずらす。
     SetNextDecisionTime(0.1f, 0.5f);
 
-    // ゲーム開始直後の攻撃合戦防止
-    // 例：開始から5秒間はAttackへ移行しない
+
+    // 次回釣り針検索可能時間を初期化する。
+    NextHookSearchTime = 0.0f;
+
+
+    // ゲーム開始直後の攻撃合戦を防止する。
     LockAttackForSeconds(InitialAttackLockDuration);
 }
+
+
+// =========================================================
+// TickComponent
+// =========================================================
 
 void UEnemyAIBrainComponent::TickComponent(
     float DeltaTime,
@@ -75,30 +188,39 @@ void UEnemyAIBrainComponent::TickComponent(
     FActorComponentTickFunction* ThisTickFunction
 )
 {
-    Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+    Super::TickComponent(
+        DeltaTime,
+        TickType,
+        ThisTickFunction
+    );
+
 
     AActor* OwnerActor = GetOwner();
 
-    // AI判断はサーバー側だけで行う
-    // クライアント側でもAI判断すると、移動や魚種変更がズレる原因になる
+
+    // AI判断はサーバー側だけで行う。
     if (!OwnerActor || !OwnerActor->HasAuthority())
     {
         return;
     }
 
-    // BeginPlay時にOwnerPawnを取れなかった場合の保険
+
+    // BeginPlay時にPawnを取得できなかった場合の保険。
     if (!OwnerPawn)
     {
         OwnerPawn = Cast<APawn>(GetOwner());
     }
 
-    // BeginPlay時にControllerがまだ入っていなかった場合の保険
+
+    // BeginPlay時にControllerがまだ無かった場合の保険。
     if (!OwnerAIController && OwnerPawn)
     {
-        OwnerAIController = Cast<AAIController>(OwnerPawn->GetController());
+        OwnerAIController =
+            Cast<AAIController>(OwnerPawn->GetController());
     }
 
-    // BeginPlay時にAIAttackComponentがまだ取れていなかった場合の保険
+
+    // BeginPlay時にAttackComponentが無かった場合の保険。
     if (!AIAttackComponent)
     {
         AIAttackComponent = GetOwner()
@@ -106,153 +228,393 @@ void UEnemyAIBrainComponent::TickComponent(
             : nullptr;
     }
 
-    // 現在のAIモードごとに処理を分ける
+
+    // 現在のAIモードごとに処理する。
     switch (CurrentMode)
     {
     case EEnemyAIMode::SpawnMove:
+
         TickSpawnMove(DeltaTime);
         break;
 
+
     case EEnemyAIMode::Devour:
+
         TickDevour(DeltaTime);
         break;
 
+
     case EEnemyAIMode::Attack:
+
         TickAttack(DeltaTime);
         break;
 
+
     case EEnemyAIMode::Wander:
+
         TickWander(DeltaTime);
         break;
 
+
     case EEnemyAIMode::Flee:
+
         TickFlee(DeltaTime);
         break;
 
+
     case EEnemyAIMode::GoToHook:
-        // TODO: GoToHookモード実装後に TickGoToHook を呼ぶ
+
+        TickGoToHook(DeltaTime);
         break;
 
+
     default:
+
         break;
     }
 }
 
-// =========================
+
+// =========================================================
 // BPから呼ぶ公開関数
-// =========================
+// =========================================================
+
 
 /**
  * AIモードを変更する。
- *
- * 重要：
- * - AttackLock中にAttackへ入ろうとした場合、Wanderへ変換する。
- * - これにより、どこからSetAIMode(Attack)されても攻撃禁止を守れる。
  */
-void UEnemyAIBrainComponent::SetAIMode(EEnemyAIMode NewMode)
+void UEnemyAIBrainComponent::SetAIMode(
+    EEnemyAIMode NewMode
+)
 {
-    // 攻撃禁止時間中はAttackへ入らない
-    if (NewMode == EEnemyAIMode::Attack && !CanEnterAttackMode())
+    // =====================================================
+    // AttackLock確認
+    // =====================================================
+
+    if (
+        NewMode == EEnemyAIMode::Attack
+        && !CanEnterAttackMode()
+    )
     {
-        NewMode = EEnemyAIMode::Wander;
+        /*
+         * GoToHookからAttackしようとしていた場合は、
+         * Wanderへ飛ばさずGoToHookを継続する。
+         */
+        if (CurrentMode == EEnemyAIMode::GoToHook)
+        {
+            NewMode = EEnemyAIMode::GoToHook;
+        }
+        else
+        {
+            NewMode = EEnemyAIMode::Wander;
+        }
     }
 
+
+    // 同じモードなら何もしない。
     if (CurrentMode == NewMode)
     {
         return;
     }
 
+
+    // =====================================================
+    // GoToHook → Attackを記録
+    // =====================================================
+
+    if (
+        CurrentMode == EEnemyAIMode::GoToHook
+        && NewMode == EEnemyAIMode::Attack
+    )
+    {
+        /*
+         * Attack終了後、
+         * WanderではなくGoToHookへ戻る。
+         */
+        bReturnToGoToHookAfterAttack = true;
+    }
+
+
+    // 実際にモードを変更する。
     CurrentMode = NewMode;
 
-    // モード変更直後は早めに判断させる
+
+    // モード変更直後は早めに判断する。
     SetNextDecisionTime(0.05f, 0.15f);
 
-    // モード別の初期化
+
+    // =====================================================
+    // モード別初期化
+    // =====================================================
+
     switch (CurrentMode)
     {
     case EEnemyAIMode::Wander:
+    {
         TargetPlanktonActor = nullptr;
         TargetFishActor = nullptr;
+
+        /*
+         * bWaitingForHookはここではfalseにしない。
+         *
+         * 理由：
+         *
+         * GoToHook
+         * ↓
+         * Goal Pointなし
+         * ↓
+         * bWaitingForHook = true
+         * ↓
+         * Wander
+         *
+         * という流れで使うため。
+         */
+
+        /*
+         * 通常のWanderへ戻った場合は、
+         * GoToHook復帰フラグを解除する。
+         *
+         * ただしReturnFromAttack()から
+         * GoToHookへ戻る場合はここへ来ない。
+         */
+        bReturnToGoToHookAfterAttack = false;
+
         break;
+    }
+
 
     case EEnemyAIMode::SpawnMove:
+    {
         TargetPlanktonActor = nullptr;
         TargetFishActor = nullptr;
+
         break;
+    }
+
 
     case EEnemyAIMode::Devour:
+    {
         TargetFishActor = nullptr;
 
-        // Devourに入ったら、まず狙うプランクトンを探す
+        // Devourへ入ったら、
+        // 最初に狙うプランクトンを選ぶ。
         SelectNearestPlankton();
+
         break;
+    }
+
 
     case EEnemyAIMode::Attack:
+    {
         TargetPlanktonActor = nullptr;
 
-        // Attackに入った時、強いAI/弱いAIに応じた魚種変更を後で行う
+        // AIレベルに応じた魚種変更を試す。
         TryChangeFishOnAttackMode();
 
-        // Attackに入ったら、まず攻撃対象を探す
-        // ただしNotifyAttackHitやWander検知でTargetFishActorがすでに入っている場合は維持する
+        /*
+         * すでに攻撃対象が設定されていれば維持。
+         *
+         * Wander検知
+         * NotifyDamaged
+         * GoToHook中Attack判定
+         *
+         * などから対象が設定されている可能性がある。
+         */
         if (!IsTargetFishValid())
         {
             SelectNearestAttackTarget();
         }
+
         break;
+    }
+
 
     case EEnemyAIMode::Flee:
+    {
         TargetPlanktonActor = nullptr;
 
-        // Fleeでは、基本的にLastDamageCauserから逃げる。
-        // LastDamageCauserが無効ならTargetFishActorを逃走元の保険として使う。
-        // そのため、ここではTargetFishActorを消さない。
+        /*
+         * すでに攻撃中なら、
+         * 逃走開始時に突進攻撃を止める。
+         */
+        if (
+            AIAttackComponent
+            && AIAttackComponent->IsAttacking()
+        )
+        {
+            AIAttackComponent->CancelDashAttack();
+        }
+
+
+        /*
+         * FleeではTargetFishActorを消さない。
+         *
+         * LastDamageCauserが無効な場合、
+         * TargetFishActorを逃走元候補として使うため。
+         */
         if (OwnerAIController)
         {
             OwnerAIController->StopMovement();
         }
 
+
         SetNextDecisionTime(0.05f, 0.15f);
+
         break;
+    }
+
 
     case EEnemyAIMode::GoToHook:
+    {
         TargetPlanktonActor = nullptr;
         TargetFishActor = nullptr;
 
-        // TODO: GoToHook実装時に釣り糸位置をTargetLocationへ入れる
-        if (OwnerAIController)
+        // Attackから正常復帰したのでフラグ解除。
+        bReturnToGoToHookAfterAttack = false;
+
+        // GoToHookへ入ったので、
+        // 一旦待機状態を解除する。
+        bWaitingForHook = false;
+
+
+        // すでに有効なGoal Pointがあるなら、
+        // その位置を目的地へ設定する。
+        if (IsHookTargetValid())
         {
-            OwnerAIController->StopMovement();
+            TargetLocation =
+                TargetHookActor->GetActorLocation();
         }
+        else
+        {
+            /*
+             * 現在有効なGoal Pointが無いため、
+             * BP側へ検索要求を送る。
+             *
+             * Broadcastは同期的なので、
+             * BP側でGoal Pointが見つかって
+             * SetHookTarget()が呼ばれれば、
+             * この時点でTargetHookActorが設定される可能性がある。
+             */
+            RequestActiveHookSearch();
+        }
+
         break;
+    }
+
 
     default:
         break;
     }
 }
 
+
 /**
- * BP_Enemy側から、GameSystemで取得したプランクトン群れActorを渡す。
+ * プランクトン群れActorを設定する。
+ *
+ * 通常Wander中のみ受け付ける。
  */
-void UEnemyAIBrainComponent::SetCollectItemGroupTarget(AActor* NewGroupActor)
+void UEnemyAIBrainComponent::SetCollectItemGroupTarget(
+    AActor* NewGroupActor
+)
 {
     if (!NewGroupActor)
     {
         return;
     }
 
+
     AActor* OwnerActor = GetOwner();
+
 
     if (!OwnerActor || !OwnerActor->HasAuthority())
     {
         return;
     }
 
+
+    /*
+     * 通常Wander中だけ受け付ける。
+     *
+     * bWaitingForHook == true の場合、
+     * 釣り針待ち中なのでSpawnMoveへ移行しない。
+     */
+    if (
+        CurrentMode != EEnemyAIMode::Wander
+        || bWaitingForHook
+    )
+    {
+        return;
+    }
+
+
     TargetGroupActor = NewGroupActor;
-    TargetLocation = NewGroupActor->GetActorLocation();
+
+
+    TargetLocation =
+        NewGroupActor->GetActorLocation();
+
 
     SetAIMode(EEnemyAIMode::SpawnMove);
 }
+
+
+/**
+ * BP側のGameSystemから取得した、
+ * 現在アクティブなGoal PointをC++へ渡す。
+ */
+void UEnemyAIBrainComponent::SetHookTarget(
+    AActor* NewHookActor
+)
+{
+    AActor* OwnerActor = GetOwner();
+
+
+    if (!OwnerActor || !OwnerActor->HasAuthority())
+    {
+        return;
+    }
+
+
+    // 無効Actorは受け付けない。
+    if (!IsValid(NewHookActor))
+    {
+        return;
+    }
+
+
+    // 現在アクティブなGoal Pointを保存する。
+    TargetHookActor = NewHookActor;
+
+
+    // 最新位置を目的地へ設定する。
+    TargetLocation =
+        TargetHookActor->GetActorLocation();
+
+
+    // Goal Pointが見つかったため待機終了。
+    bWaitingForHook = false;
+
+
+    /*
+     * 現在GoToHookでない場合は、
+     * GoToHookへ移行する。
+     *
+     * 例えば：
+     *
+     * 釣り針待ちWander
+     * ↓
+     * BP検索でGoal Point発見
+     * ↓
+     * SetHookTarget
+     * ↓
+     * GoToHook
+     */
+    if (CurrentMode != EEnemyAIMode::GoToHook)
+    {
+        SetAIMode(EEnemyAIMode::GoToHook);
+    }
+}
+
 
 /**
  * AIがプランクトンを1つ取得した時に呼ぶ。
@@ -261,83 +623,139 @@ void UEnemyAIBrainComponent::NotifyPlanktonCollected()
 {
     AActor* OwnerActor = GetOwner();
 
+
     if (!OwnerActor || !OwnerActor->HasAuthority())
     {
         return;
     }
 
+
+    // 食べた数を加算する。
     EatenPlanktonCount++;
 
-    // プランクトン取得時、常に20%でAttackへ移行
-    // ただしAttackLock中ならSetAIMode側でWanderへ変換される
+
+    // =====================================================
+    // 強制GoToHook
+    // =====================================================
+
+    if (ShouldForceGoToHook())
+    {
+        SetAIMode(EEnemyAIMode::GoToHook);
+        return;
+    }
+
+
+    // =====================================================
+    // 通常Attack判定
+    // =====================================================
+
+    // デフォルト20%でAttack。
     if (TryChance(DevourAttackChance))
     {
         SetAIMode(EEnemyAIMode::Attack);
         return;
     }
 
-    // 食べた数によってGoToHookへ移行するか判定
-    // GoToHook未実装中に止まる場合は、ここを一時的にコメントアウトしてOK
+
+    // =====================================================
+    // プランクトン数によるGoToHook抽選
+    // =====================================================
+
+    /*
+     * 10個以上 → 12.5%
+     * 20個以上 → 25%
+     * 30個以上 → 50%
+     * 40個以上 → 100%
+     */
     if (TryGoToHookByPlanktonCount())
     {
         SetAIMode(EEnemyAIMode::GoToHook);
         return;
     }
 
-    // SpawnMove中にプランクトンを拾った場合は、Devourへ入る
+
+    // SpawnMove中にプランクトンを拾った場合はDevourへ。
     if (CurrentMode == EEnemyAIMode::SpawnMove)
     {
         SetAIMode(EEnemyAIMode::Devour);
     }
 }
 
+
 /**
- * 自分が攻撃を食らった時にBP側から呼ぶ。
- *
- * AttackLock中：
- * - 反撃Attackを抑制する
- * - 攻撃合戦の再発を防ぐ
- *
- * 通常時：
- * - HP20%未満なら70%でFlee
- * - HP20%〜79%なら20%でFlee
- * - HP80%以上ならAttack継続
+ * 自分が攻撃を受けた時に呼ぶ。
  */
-void UEnemyAIBrainComponent::NotifyDamaged(float CurrentHP, float MaxHP, AActor* DamageCauser)
+void UEnemyAIBrainComponent::NotifyDamaged(
+    float CurrentHP,
+    float MaxHP,
+    AActor* DamageCauser
+)
 {
     AActor* OwnerActor = GetOwner();
+
 
     if (!OwnerActor || !OwnerActor->HasAuthority())
     {
         return;
     }
 
-    // 直前に自分へダメージを与えた相手を保存
-    // Fleeでは基本的にこのActorから逃げる
+
+    // 最後に自分へダメージを与えた相手を保存。
     LastDamageCauser = DamageCauser;
 
-    // 攻撃禁止時間中は反撃Attackへ入らない
-    // ここで即反撃すると、開始直後やリスポーン直後の攻撃合戦が再発する
-    if (IsAttackLocked() && bDisableAttackReactionDuringAttackLock)
+
+    // =====================================================
+    // AttackLock中
+    // =====================================================
+
+    if (
+        IsAttackLocked()
+        && bDisableAttackReactionDuringAttackLock
+    )
     {
-        // 攻撃中だった場合は止める
-        if (AIAttackComponent && AIAttackComponent->IsAttacking())
+        // 攻撃中ならキャンセル。
+        if (
+            AIAttackComponent
+            && AIAttackComponent->IsAttacking()
+        )
         {
             AIAttackComponent->CancelDashAttack();
         }
 
-        SetAIMode(EEnemyAIMode::Wander);
+
+        /*
+         * GoToHookから始まったAttackなら
+         * GoToHookへ戻す。
+         */
+        if (bReturnToGoToHookAfterAttack)
+        {
+            ReturnFromAttack();
+        }
+        else
+        {
+            SetAIMode(EEnemyAIMode::Wander);
+        }
+
+
         return;
     }
+
 
     if (MaxHP <= KINDA_SMALL_NUMBER)
     {
         return;
     }
 
-    const float HpRate = CurrentHP / MaxHP;
 
-    // HP20%未満：70%でFlee
+    const float HpRate =
+        CurrentHP / MaxHP;
+
+
+    // =====================================================
+    // HP20%未満
+    // 70%でFlee
+    // =====================================================
+
     if (HpRate < LowHpFleeThreshold)
     {
         if (TryChance(LowHpFleeChance))
@@ -346,17 +764,25 @@ void UEnemyAIBrainComponent::NotifyDamaged(float CurrentHP, float MaxHP, AActor*
             return;
         }
 
-        // 逃走しなかったらAttack継続
+
+        // Fleeしなければ反撃。
         if (IsValidAttackCandidate(DamageCauser))
         {
             TargetFishActor = DamageCauser;
         }
 
+
         SetAIMode(EEnemyAIMode::Attack);
+
         return;
     }
 
-    // HP20%〜79%：20%でFlee
+
+    // =====================================================
+    // HP20%～79%
+    // 20%でFlee
+    // =====================================================
+
     if (HpRate < MidHpFleeThreshold)
     {
         if (TryChance(MidHpFleeChance))
@@ -365,32 +791,36 @@ void UEnemyAIBrainComponent::NotifyDamaged(float CurrentHP, float MaxHP, AActor*
             return;
         }
 
-        // 逃走しなかったらAttack継続
+
         if (IsValidAttackCandidate(DamageCauser))
         {
             TargetFishActor = DamageCauser;
         }
 
+
         SetAIMode(EEnemyAIMode::Attack);
+
         return;
     }
 
-    // HP80%以上：Attack継続
+
+    // =====================================================
+    // HP80%以上
+    // Attack
+    // =====================================================
+
     if (IsValidAttackCandidate(DamageCauser))
     {
         TargetFishActor = DamageCauser;
     }
 
+
     SetAIMode(EEnemyAIMode::Attack);
 }
 
+
 /**
- * 自分の攻撃が相手に当たった時にBP側から呼ぶ。
- *
- * 処理：
- * - 自身HP割合を計算
- * - HP80%以上ならAttack継続
- * - HP80%未満ならWanderへ戻る
+ * 自分の攻撃が相手へ当たった時に呼ぶ。
  */
 void UEnemyAIBrainComponent::NotifyAttackHit(
     AActor* HitActor,
@@ -401,51 +831,72 @@ void UEnemyAIBrainComponent::NotifyAttackHit(
 {
     AActor* OwnerActor = GetOwner();
 
+
     if (!OwnerActor || !OwnerActor->HasAuthority())
     {
         return;
     }
 
-    // 最大HPが0以下なら割合計算できないので、安全のためWanderへ戻る
+
+    // 最大HPが不正ならAttack終了。
     if (MaxHP <= KINDA_SMALL_NUMBER)
     {
         TargetFishActor = nullptr;
-        SetAIMode(EEnemyAIMode::Wander);
+
+        ReturnFromAttack();
+
         return;
     }
 
-    const float HpRate = CurrentHP / MaxHP;
 
-    // =========================
-    // 自身HP80%以上ならAttack継続
-    // =========================
+    const float HpRate =
+        CurrentHP / MaxHP;
+
+
+    // =====================================================
+    // 自身HP80%以上
+    // Attack継続
+    // =====================================================
+
     if (HpRate >= AttackContinueHpRate)
     {
-        // 当てた相手を次の攻撃対象として保持する
-        // SafeZone中のActorは攻撃対象にしない
         if (IsValidAttackCandidate(HitActor))
         {
             TargetFishActor = HitActor;
-            TargetLocation = HitActor->GetActorLocation();
+
+            TargetLocation =
+                HitActor->GetActorLocation();
         }
         else
         {
             TargetFishActor = nullptr;
         }
 
-        // 攻撃継続時に少し待つ
-        // 連続で即突進しすぎる場合の調整用
-        SetNextDecisionTime(AttackContinueDelayMin, AttackContinueDelayMax);
 
-        // AttackLock中ならSetAIMode側でWanderへ変換される
+        SetNextDecisionTime(
+            AttackContinueDelayMin,
+            AttackContinueDelayMax
+        );
+
+
+        /*
+         * すでにAttack中の場合、
+         * SetAIModeは同一モードとしてreturnする。
+         *
+         * ただしTargetFishActorとNextDecisionTimeは
+         * 上ですでに更新済み。
+         */
         SetAIMode(EEnemyAIMode::Attack);
+
         return;
     }
 
-    // =========================
-    // 今後追加予定：
-    // 相手がAIで、相手がFleeへ移行した場合の追撃処理
-    // =========================
+
+    // =====================================================
+    // 相手がFleeへ入った場合
+    // 50%で追跡
+    // =====================================================
+
     if (HitActor && bHitActorBecameFlee)
     {
         if (TryChance(ChaseFleeTargetChance))
@@ -453,67 +904,101 @@ void UEnemyAIBrainComponent::NotifyAttackHit(
             if (IsValidAttackCandidate(HitActor))
             {
                 TargetFishActor = HitActor;
-                TargetLocation = HitActor->GetActorLocation();
+
+
+                TargetLocation =
+                    HitActor->GetActorLocation();
+
 
                 ChaseEndTime = GetWorld()
-                    ? GetWorld()->GetTimeSeconds() + FMath::FRandRange(ChaseFleeTimeMin, ChaseFleeTimeMax)
+                    ? GetWorld()->GetTimeSeconds()
+                        + FMath::FRandRange(
+                            ChaseFleeTimeMin,
+                            ChaseFleeTimeMax
+                        )
                     : 0.0f;
 
-                SetNextDecisionTime(AttackContinueDelayMin, AttackContinueDelayMax);
+
+                SetNextDecisionTime(
+                    AttackContinueDelayMin,
+                    AttackContinueDelayMax
+                );
+
+
                 SetAIMode(EEnemyAIMode::Attack);
+
                 return;
             }
         }
     }
 
-    // =========================
-    // それ以外はWanderへ戻る
-    // =========================
+
+    // =====================================================
+    // それ以外
+    // Attack終了
+    // =====================================================
+
     TargetFishActor = nullptr;
-    SetAIMode(EEnemyAIMode::Wander);
+
+
+    ReturnFromAttack();
 }
 
+
 /**
- * 指定秒数、Attackへ移行しないようにする。
- *
- * 使用例：
- * - BeginPlay
- * - リスポーン後
- * - ゴール後
- * - SafeZoneから出た直後
+ * 指定秒数Attackを禁止する。
  */
-void UEnemyAIBrainComponent::LockAttackForSeconds(float Duration)
+void UEnemyAIBrainComponent::LockAttackForSeconds(
+    float Duration
+)
 {
     if (!GetWorld())
     {
         return;
     }
 
+
     if (Duration <= 0.0f)
     {
         return;
     }
 
-    const float NewEndTime = GetWorld()->GetTimeSeconds() + Duration;
 
-    // すでに長い攻撃禁止時間がある場合、短い時間で上書きしない
-    AttackLockEndTime = FMath::Max(AttackLockEndTime, NewEndTime);
+    const float NewEndTime =
+        GetWorld()->GetTimeSeconds() + Duration;
 
-    // 攻撃中に保護が入った場合は、攻撃を止めてWanderへ戻す
+
+    // すでに長いAttackLockがある場合、
+    // 短い時間で上書きしない。
+    AttackLockEndTime =
+        FMath::Max(
+            AttackLockEndTime,
+            NewEndTime
+        );
+
+
+    // Attack中なら攻撃キャンセル。
     if (CurrentMode == EEnemyAIMode::Attack)
     {
-        if (AIAttackComponent && AIAttackComponent->IsAttacking())
+        if (
+            AIAttackComponent
+            && AIAttackComponent->IsAttacking()
+        )
         {
             AIAttackComponent->CancelDashAttack();
         }
 
+
         TargetFishActor = nullptr;
-        SetAIMode(EEnemyAIMode::Wander);
+
+
+        ReturnFromAttack();
     }
 }
 
+
 /**
- * 現在Attack禁止中かどうか。
+ * 現在AttackLock中か確認する。
  */
 bool UEnemyAIBrainComponent::IsAttackLocked() const
 {
@@ -522,41 +1007,153 @@ bool UEnemyAIBrainComponent::IsAttackLocked() const
         return false;
     }
 
-    return GetWorld()->GetTimeSeconds() < AttackLockEndTime;
+
+    return
+        GetWorld()->GetTimeSeconds()
+        < AttackLockEndTime;
 }
 
-// =========================
+
+/**
+ * 現在、
+ * アクティブなGoal Pointを待っているか確認する。
+ */
+bool UEnemyAIBrainComponent::IsWaitingForHook() const
+{
+    return bWaitingForHook;
+}
+
+
+// =========================================================
 // モード別Tick
-// =========================
+// =========================================================
+
 
 /**
  * Wanderモード。
  *
- * 追加仕様：
- * - Wander中、3セル以内にFishタグActorがいたらAttackへ移行する。
- * - ただしAttackLock中は検知しない。
- * - SafeZoneタグ持ちActorは検知対象から除外する。
+ * 優先順位：
+ *
+ * 1.
+ * 釣り針待ち中なら定期的にBPへ検索要求
+ *
+ * 2.
+ * 強制GoToHook
+ *
+ * 3.
+ * 近距離Attack判定
+ *
+ * 4.
+ * 通常ランダム遊泳
  */
-void UEnemyAIBrainComponent::TickWander(float DeltaTime)
+void UEnemyAIBrainComponent::TickWander(
+    float DeltaTime
+)
 {
+    // =====================================================
+    // 1. 釣り針待ち中の再検索
+    // =====================================================
+
+    /*
+     * ここはShouldMakeDecision()より前に置く。
+     *
+     * 理由：
+     *
+     * 通常Wander判断間隔と、
+     * Goal Point再検索間隔を分離するため。
+     */
+    if (bWaitingForHook && GetWorld())
+    {
+        const float CurrentTime =
+            GetWorld()->GetTimeSeconds();
+
+
+        if (CurrentTime >= NextHookSearchTime)
+        {
+            RequestActiveHookSearch();
+
+
+            /*
+             * Broadcast先のBPでGoal Pointが見つかり、
+             * SetHookTarget()が同期的に呼ばれた場合、
+             * CurrentModeがGoToHookへ変わっている。
+             *
+             * その場合はWander処理を続けない。
+             */
+            if (CurrentMode != EEnemyAIMode::Wander)
+            {
+                return;
+            }
+        }
+    }
+
+
+    // 通常AI判断時間でなければ、
+    // ここから下は実行しない。
     if (!ShouldMakeDecision())
     {
         return;
     }
 
-    // Wander中の近距離敵検知。
-    // AttackLock中は攻撃合戦を避けるため検知しない。
-    if (!IsAttackLocked() || !bDisableWanderDetectDuringAttackLock)
+
+    // =====================================================
+    // 2. 強制GoToHook
+    // =====================================================
+
+    /*
+     * bWaitingForHook中に実行すると、
+     *
+     * Wander
+     * ↓
+     * GoToHook
+     * ↓
+     * Goal Pointなし
+     * ↓
+     * Wander
+     *
+     * を繰り返すため、
+     * 待機中は強制移行しない。
+     */
+    if (
+        !bWaitingForHook
+        && ShouldForceGoToHook()
+    )
     {
-        if (TryDetectEnemyInWander())
+        SetAIMode(EEnemyAIMode::GoToHook);
+
+        return;
+    }
+
+
+    // =====================================================
+    // 3. 近距離Attack判定
+    // =====================================================
+
+    // Goal Point待ち中はAttackしない。
+    if (!bWaitingForHook)
+    {
+        if (
+            !IsAttackLocked()
+            || !bDisableWanderDetectDuringAttackLock
+        )
         {
-            return;
+            if (TryDetectEnemyInWander())
+            {
+                return;
+            }
         }
     }
 
-    const float RandomValue = FMath::FRand();
 
-    // 30%で停止
+    // =====================================================
+    // 4. 通常Wander
+    // =====================================================
+
+    const float RandomValue =
+        FMath::FRand();
+
+
+    // 30%で停止。
     if (RandomValue < 0.3f)
     {
         if (OwnerAIController)
@@ -564,16 +1161,28 @@ void UEnemyAIBrainComponent::TickWander(float DeltaTime)
             OwnerAIController->StopMovement();
         }
 
-        SetNextDecisionTime(WanderWaitMin, WanderWaitMax);
+
+        SetNextDecisionTime(
+            WanderWaitMin,
+            WanderWaitMax
+        );
+
+
         return;
     }
 
-    // 70%でランダム地点へ移動
-    const bool bMoved = MoveToRandomLocation();
+
+    // 70%でランダム移動。
+    const bool bMoved =
+        MoveToRandomLocation();
+
 
     if (bMoved)
     {
-        SetNextDecisionTime(WanderWaitMin, WanderWaitMax);
+        SetNextDecisionTime(
+            WanderWaitMin,
+            WanderWaitMax
+        );
     }
     else
     {
@@ -581,38 +1190,50 @@ void UEnemyAIBrainComponent::TickWander(float DeltaTime)
     }
 }
 
+
 /**
  * SpawnMoveモード。
  */
-void UEnemyAIBrainComponent::TickSpawnMove(float DeltaTime)
+void UEnemyAIBrainComponent::TickSpawnMove(
+    float DeltaTime
+)
 {
     if (!ShouldMakeDecision())
     {
         return;
     }
 
-    // 群れActorが有効なら、群れ中央位置を更新する
-    if (TargetGroupActor)
+
+    // 群れActorが有効なら、
+    // 現在位置を更新する。
+    if (IsValid(TargetGroupActor))
     {
-        TargetLocation = TargetGroupActor->GetActorLocation();
+        TargetLocation =
+            TargetGroupActor->GetActorLocation();
     }
 
-    // SpawnMove中、3%でAttackへ移行
-    // AttackLock中ならSetAIMode側でWanderへ変換される
+
+    // SpawnMove中、3%でAttack。
     if (TryChance(SpawnMoveAttackChance))
     {
         SetAIMode(EEnemyAIMode::Attack);
+
         return;
     }
 
-    // 群れ中央にだいたい近づいたらDevourへ移行
+
+    // 群れ中央へ到着。
     if (IsNearTargetLocation())
     {
         SetAIMode(EEnemyAIMode::Devour);
+
         return;
     }
 
-    const bool bMoved = MoveByARuleToLocation(TargetLocation);
+
+    const bool bMoved =
+        MoveByARuleToLocation(TargetLocation);
+
 
     if (bMoved)
     {
@@ -624,41 +1245,66 @@ void UEnemyAIBrainComponent::TickSpawnMove(float DeltaTime)
     }
 }
 
+
 /**
  * Devourモード。
  */
-void UEnemyAIBrainComponent::TickDevour(float DeltaTime)
+void UEnemyAIBrainComponent::TickDevour(
+    float DeltaTime
+)
 {
     if (!ShouldMakeDecision())
     {
         return;
     }
 
-    // 狙っているプランクトンが無効なら、近くの別プランクトンを探す
+
+    // 強制条件を満たした場合はGoToHook。
+    if (ShouldForceGoToHook())
+    {
+        SetAIMode(EEnemyAIMode::GoToHook);
+
+        return;
+    }
+
+
+    // 現在のプランクトンが無効なら、
+    // 新しいものを探す。
     if (!IsTargetPlanktonValid())
     {
-        const bool bFound = SelectNearestPlankton();
+        const bool bFound =
+            SelectNearestPlankton();
+
 
         if (!bFound)
         {
-            // 周囲のプランクトンが全て消えた扱い
-            // 仕様：強制的にAttackへ移行
-            // AttackLock中ならSetAIMode側でWanderへ変換される
+            /*
+             * 周囲にプランクトンがなくなった場合、
+             * 仕様上Attackへ強制移行。
+             */
             SetAIMode(EEnemyAIMode::Attack);
+
             return;
         }
     }
 
-    // ここでもう一度確認
+
+    // 念のため再確認。
     if (!IsTargetPlanktonValid())
     {
         SetAIMode(EEnemyAIMode::Attack);
+
         return;
     }
 
-    TargetLocation = TargetPlanktonActor->GetActorLocation();
 
-    const bool bMoved = MoveByARuleToLocation(TargetLocation);
+    TargetLocation =
+        TargetPlanktonActor->GetActorLocation();
+
+
+    const bool bMoved =
+        MoveByARuleToLocation(TargetLocation);
+
 
     if (bMoved)
     {
@@ -666,65 +1312,105 @@ void UEnemyAIBrainComponent::TickDevour(float DeltaTime)
     }
     else
     {
-        // 移動できないなら別のプランクトンを探す
         TargetPlanktonActor = nullptr;
+
         SetNextDecisionTime(0.1f, 0.2f);
     }
 }
 
+
 /**
  * Attackモード。
  */
-void UEnemyAIBrainComponent::TickAttack(float DeltaTime)
+void UEnemyAIBrainComponent::TickAttack(
+    float DeltaTime
+)
 {
-    // 念のため、AttackLock中にAttackへ残っていたらWanderへ戻す
+    // =====================================================
+    // AttackLock確認
+    // =====================================================
+
     if (!CanEnterAttackMode())
     {
-        if (AIAttackComponent && AIAttackComponent->IsAttacking())
+        if (
+            AIAttackComponent
+            && AIAttackComponent->IsAttacking()
+        )
         {
             AIAttackComponent->CancelDashAttack();
         }
 
+
         TargetFishActor = nullptr;
-        SetAIMode(EEnemyAIMode::Wander);
+
+
+        ReturnFromAttack();
+
         return;
     }
 
-    // 攻撃コンポーネントが攻撃中なら、Brain側は何もしない
-    // ここでMoveToを出すと、突進方向が崩れる
-    if (AIAttackComponent && AIAttackComponent->IsAttacking())
+
+    // =====================================================
+    // 突進攻撃中
+    // =====================================================
+
+    if (
+        AIAttackComponent
+        && AIAttackComponent->IsAttacking()
+    )
     {
+        /*
+         * 攻撃Componentが攻撃中なら、
+         * Brain側からMoveToを出さない。
+         *
+         * MoveToを出すと突進方向を崩す可能性がある。
+         */
         return;
     }
+
 
     if (!ShouldMakeDecision())
     {
         return;
     }
 
-    // 攻撃対象がいなければ探す
+
+    // =====================================================
+    // 攻撃対象確認
+    // =====================================================
+
     if (!IsTargetFishValid())
     {
-        const bool bFound = SelectNearestAttackTarget();
+        const bool bFound =
+            SelectNearestAttackTarget();
+
 
         if (!bFound)
         {
-            SetAIMode(EEnemyAIMode::Wander);
+            ReturnFromAttack();
+
             return;
         }
     }
 
-    // ここでもう一度確認
+
     if (!IsTargetFishValid())
     {
-        SetAIMode(EEnemyAIMode::Wander);
+        ReturnFromAttack();
+
         return;
     }
 
-    // 対象の現在位置を目的地にする
-    TargetLocation = TargetFishActor->GetActorLocation();
 
-    // 攻撃可能距離に入ったら、AI専用ダッシュ攻撃を開始する
+    // 対象位置更新。
+    TargetLocation =
+        TargetFishActor->GetActorLocation();
+
+
+    // =====================================================
+    // 攻撃距離以内
+    // =====================================================
+
     if (IsNearAttackTarget())
     {
         if (OwnerAIController)
@@ -732,86 +1418,264 @@ void UEnemyAIBrainComponent::TickAttack(float DeltaTime)
             OwnerAIController->StopMovement();
         }
 
+
         if (AIAttackComponent)
         {
-            const bool bStarted = AIAttackComponent->StartDashAttack(TargetFishActor);
+            const bool bStarted =
+                AIAttackComponent->StartDashAttack(
+                    TargetFishActor
+                );
+
 
             if (bStarted)
             {
-                // 攻撃開始できたら、攻撃コンポーネント側がチャージ/突進を担当する
-                // Brain側はしばらく再判断を遅らせる
+                // チャージと突進はAttackComponent側へ任せる。
                 SetNextDecisionTime(1.0f, 1.2f);
+
                 return;
             }
         }
 
-        // AIAttackComponentが無い、または攻撃開始に失敗した場合だけ仮終了
+
+        // 攻撃開始失敗。
         FinishAttackTemporarily();
+
         return;
     }
 
-    const bool bMoved = MoveByARuleToLocation(TargetLocation);
+
+    // =====================================================
+    // 対象へ接近
+    // =====================================================
+
+    const bool bMoved =
+        MoveByARuleToLocation(TargetLocation);
+
 
     if (bMoved)
     {
-        SetNextDecisionTime(AttackThinkIntervalMin, AttackThinkIntervalMax);
+        SetNextDecisionTime(
+            AttackThinkIntervalMin,
+            AttackThinkIntervalMax
+        );
     }
     else
     {
-        // 移動できない場合は対象を取り直す
+        // 移動できなければ対象を取り直す。
         TargetFishActor = nullptr;
+
         SetNextDecisionTime(0.2f, 0.4f);
     }
 }
 
+
 /**
  * Fleeモード。
  */
-void UEnemyAIBrainComponent::TickFlee(float DeltaTime)
+void UEnemyAIBrainComponent::TickFlee(
+    float DeltaTime
+)
 {
     if (!ShouldMakeDecision())
     {
         return;
     }
 
-    AActor* FleeSourceActor = GetFleeSourceActor();
 
-    // 逃走元がいないなら逃げる理由がないのでWanderへ戻る
+    AActor* FleeSourceActor =
+        GetFleeSourceActor();
+
+
+    // 逃走元が無効。
     if (!FleeSourceActor)
     {
-        SetAIMode(EEnemyAIMode::Wander);
+        if (ShouldForceGoToHook())
+        {
+            SetAIMode(EEnemyAIMode::GoToHook);
+        }
+        else
+        {
+            SetAIMode(EEnemyAIMode::Wander);
+        }
+
+
         return;
     }
 
-    // 12セルほど離れたら逃走完了
+
+    // 12セル以上離れたら逃走終了。
     if (IsFarEnoughFromFleeSource())
     {
         LastDamageCauser = nullptr;
-        SetAIMode(EEnemyAIMode::Wander);
+
+
+        if (ShouldForceGoToHook())
+        {
+            SetAIMode(EEnemyAIMode::GoToHook);
+        }
+        else
+        {
+            SetAIMode(EEnemyAIMode::Wander);
+        }
+
+
         return;
     }
 
-    // まだ近いなら、相手から遠ざかるようにAルール移動する
-    const bool bMoved = MoveByARuleAwayFromActor(FleeSourceActor);
+
+    // 相手からAルールで逃げる。
+    const bool bMoved =
+        MoveByARuleAwayFromActor(FleeSourceActor);
+
 
     if (bMoved)
     {
-        SetNextDecisionTime(FleeThinkIntervalMin, FleeThinkIntervalMax);
+        SetNextDecisionTime(
+            FleeThinkIntervalMin,
+            FleeThinkIntervalMax
+        );
     }
     else
     {
-        // 移動先が取れなかった場合も、少し待って再試行する
         SetNextDecisionTime(0.3f, 0.6f);
     }
 }
 
-// =========================
+
+/**
+ * GoToHookモード。
+ *
+ * GameSystemからBP経由で受け取った、
+ * 現在アクティブなGoal Pointへ向かう。
+ */
+void UEnemyAIBrainComponent::TickGoToHook(
+    float DeltaTime
+)
+{
+    if (!ShouldMakeDecision())
+    {
+        return;
+    }
+
+
+    // =====================================================
+    // 1. Goal Point確認
+    // =====================================================
+
+    if (!IsHookTargetValid())
+    {
+        /*
+         * 現在有効なGoal Pointがないため、
+         * BP側へ検索要求を送る。
+         */
+        RequestActiveHookSearch();
+
+
+        /*
+         * Broadcast先のBPで、
+         * すぐにSetHookTarget()が呼ばれた可能性がある。
+         *
+         * そのためもう一度確認する。
+         */
+        if (!IsHookTargetValid())
+        {
+            /*
+             * まだ見つからない。
+             *
+             * 一時的にWanderへ戻り、
+             * 一定間隔で再検索する。
+             */
+            bWaitingForHook = true;
+
+
+            SetAIMode(EEnemyAIMode::Wander);
+
+
+            return;
+        }
+    }
+
+
+    // ここまで来たら有効Goal Pointあり。
+    bWaitingForHook = false;
+
+
+    // Goal Pointの現在位置を毎回更新する。
+    TargetLocation =
+        TargetHookActor->GetActorLocation();
+
+
+    // =====================================================
+    // 2. 到着判定
+    // =====================================================
+
+    if (IsNearHook())
+    {
+        /*
+         * 実際のゴール処理がOverlapなら、
+         * ここでは余計なモード変更をしない。
+         *
+         * Goal Point付近で停止する。
+         */
+        if (OwnerAIController)
+        {
+            OwnerAIController->StopMovement();
+        }
+
+
+        SetNextDecisionTime(
+            GoToHookThinkIntervalMin,
+            GoToHookThinkIntervalMax
+        );
+
+
+        return;
+    }
+
+
+    // =====================================================
+    // 3. 周囲の魚によるAttack判定
+    // =====================================================
+
+    if (CanEnterAttackMode())
+    {
+        if (TryAttackDuringGoToHook())
+        {
+            return;
+        }
+    }
+
+
+    // =====================================================
+    // 4. AルールでGoal Pointへ移動
+    // =====================================================
+
+    const bool bMoved =
+        MoveByARuleToLocation(TargetLocation);
+
+
+    if (bMoved)
+    {
+        SetNextDecisionTime(
+            GoToHookThinkIntervalMin,
+            GoToHookThinkIntervalMax
+        );
+    }
+    else
+    {
+        SetNextDecisionTime(0.3f, 0.6f);
+    }
+}
+
+
+// =========================================================
 // Wander用関数
-// =========================
+// =========================================================
+
 
 /**
  * NavMesh上のランダム地点を探し、
- * その地点を目的地としてAルールで移動する。
+ * Aルールで移動する。
  */
 bool UEnemyAIBrainComponent::MoveToRandomLocation()
 {
@@ -820,52 +1684,71 @@ bool UEnemyAIBrainComponent::MoveToRandomLocation()
         return false;
     }
 
-    UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(GetWorld());
+
+    UNavigationSystemV1* NavSys =
+        UNavigationSystemV1::GetCurrent(GetWorld());
+
 
     if (!NavSys)
     {
         return false;
     }
 
+
     FNavLocation RandomLocation;
 
-    const bool bFound = NavSys->GetRandomReachablePointInRadius(
-        OwnerPawn->GetActorLocation(),
-        WanderRadius,
-        RandomLocation
-    );
+
+    const bool bFound =
+        NavSys->GetRandomReachablePointInRadius(
+            OwnerPawn->GetActorLocation(),
+            WanderRadius,
+            RandomLocation
+        );
+
 
     if (!bFound)
     {
         return false;
     }
 
-    return MoveByARuleToLocation(RandomLocation.Location);
+
+    return MoveByARuleToLocation(
+        RandomLocation.Location
+    );
 }
 
+
 /**
- * Wander中、3セル以内に攻撃対象がいるか確認する。
+ * Wander中に近距離魚を検知する。
  */
 bool UEnemyAIBrainComponent::TryDetectEnemyInWander()
 {
-    AActor* EnemyActor = FindNearestWanderEnemy();
+    AActor* EnemyActor =
+        FindNearestWanderEnemy();
+
 
     if (!EnemyActor)
     {
         return false;
     }
 
+
     TargetFishActor = EnemyActor;
-    TargetLocation = EnemyActor->GetActorLocation();
+
+
+    TargetLocation =
+        EnemyActor->GetActorLocation();
+
 
     SetAIMode(EEnemyAIMode::Attack);
-    return true;
+
+
+    return CurrentMode == EEnemyAIMode::Attack;
 }
 
+
 /**
- * Wander中に反応する近距離魚を探す。
- *
- * SafeZoneタグ持ちActorは除外する。
+ * Wander中の近距離対象を探す。
  */
 AActor* UEnemyAIBrainComponent::FindNearestWanderEnemy() const
 {
@@ -874,16 +1757,35 @@ AActor* UEnemyAIBrainComponent::FindNearestWanderEnemy() const
         return nullptr;
     }
 
-    TArray<AActor*> FishActors;
-    UGameplayStatics::GetAllActorsWithTag(GetWorld(), FishTagName, FishActors);
 
-    const FVector MyLocation = OwnerPawn->GetActorLocation();
+    TArray<AActor*> FishActors;
+
+
+    UGameplayStatics::GetAllActorsWithTag(
+        GetWorld(),
+        FishTagName,
+        FishActors
+    );
+
+
+    const FVector MyLocation =
+        OwnerPawn->GetActorLocation();
+
 
     AActor* NearestEnemy = nullptr;
-    float NearestDistanceSq = TNumericLimits<float>::Max();
 
-    const float DetectDistance = WanderEnemyDetectCells * CellSize;
-    const float DetectDistanceSq = DetectDistance * DetectDistance;
+
+    float NearestDistanceSq =
+        TNumericLimits<float>::Max();
+
+
+    const float DetectDistance =
+        WanderEnemyDetectCells * CellSize;
+
+
+    const float DetectDistanceSq =
+        DetectDistance * DetectDistance;
+
 
     for (AActor* FishActor : FishActors)
     {
@@ -892,32 +1794,40 @@ AActor* UEnemyAIBrainComponent::FindNearestWanderEnemy() const
             continue;
         }
 
-        const float DistanceSq = FVector::DistSquared2D(
-            MyLocation,
-            FishActor->GetActorLocation()
-        );
+
+        const float DistanceSq =
+            FVector::DistSquared2D(
+                MyLocation,
+                FishActor->GetActorLocation()
+            );
+
 
         if (DistanceSq > DetectDistanceSq)
         {
             continue;
         }
 
+
         if (DistanceSq < NearestDistanceSq)
         {
             NearestDistanceSq = DistanceSq;
+
             NearestEnemy = FishActor;
         }
     }
 
+
     return NearestEnemy;
 }
 
-// =========================
+
+// =========================================================
 // SpawnMove / Target用関数
-// =========================
+// =========================================================
+
 
 /**
- * TargetLocationに十分近いか判定する。
+ * TargetLocationへ十分近いか確認する。
  */
 bool UEnemyAIBrainComponent::IsNearTargetLocation() const
 {
@@ -926,20 +1836,25 @@ bool UEnemyAIBrainComponent::IsNearTargetLocation() const
         return false;
     }
 
-    const float Distance = FVector::Dist2D(
-        OwnerPawn->GetActorLocation(),
-        TargetLocation
-    );
+
+    const float Distance =
+        FVector::Dist2D(
+            OwnerPawn->GetActorLocation(),
+            TargetLocation
+        );
+
 
     return Distance <= TargetReachedDistance;
 }
 
-// =========================
+
+// =========================================================
 // Devour用関数
-// =========================
+// =========================================================
+
 
 /**
- * 周囲のプランクトンから一番近いものを探す。
+ * 一番近いプランクトンを探す。
  */
 AActor* UEnemyAIBrainComponent::FindNearestPlankton() const
 {
@@ -948,102 +1863,145 @@ AActor* UEnemyAIBrainComponent::FindNearestPlankton() const
         return nullptr;
     }
 
-    TArray<AActor*> PlanktonActors;
-    UGameplayStatics::GetAllActorsWithTag(GetWorld(), PlanktonTagName, PlanktonActors);
 
-    const FVector MyLocation = OwnerPawn->GetActorLocation();
+    TArray<AActor*> PlanktonActors;
+
+
+    UGameplayStatics::GetAllActorsWithTag(
+        GetWorld(),
+        PlanktonTagName,
+        PlanktonActors
+    );
+
+
+    const FVector MyLocation =
+        OwnerPawn->GetActorLocation();
+
 
     AActor* NearestPlankton = nullptr;
-    float NearestDistanceSq = TNumericLimits<float>::Max();
 
-    const float SearchRadiusSq = DevourSearchRadius * DevourSearchRadius;
+
+    float NearestDistanceSq =
+        TNumericLimits<float>::Max();
+
+
+    const float SearchRadiusSq =
+        DevourSearchRadius * DevourSearchRadius;
+
 
     for (AActor* PlanktonActor : PlanktonActors)
     {
-        if (!PlanktonActor)
+        if (!IsValid(PlanktonActor))
         {
             continue;
         }
 
-        const float DistanceSq = FVector::DistSquared2D(
-            MyLocation,
-            PlanktonActor->GetActorLocation()
-        );
+
+        const float DistanceSq =
+            FVector::DistSquared2D(
+                MyLocation,
+                PlanktonActor->GetActorLocation()
+            );
+
 
         if (DistanceSq > SearchRadiusSq)
         {
             continue;
         }
 
+
         if (DistanceSq < NearestDistanceSq)
         {
             NearestDistanceSq = DistanceSq;
+
             NearestPlankton = PlanktonActor;
         }
     }
 
+
     return NearestPlankton;
 }
 
+
 /**
- * TargetPlanktonActorがまだ有効か確認する。
+ * TargetPlanktonActorが有効か確認する。
  */
 bool UEnemyAIBrainComponent::IsTargetPlanktonValid() const
 {
     return IsValid(TargetPlanktonActor);
 }
 
+
 /**
- * TargetPlanktonActorに十分近いか確認する。
+ * TargetPlanktonActorへ十分近いか確認する。
  */
 bool UEnemyAIBrainComponent::IsNearTargetPlankton() const
 {
-    if (!OwnerPawn || !IsTargetPlanktonValid())
+    if (
+        !OwnerPawn
+        || !IsTargetPlanktonValid()
+    )
     {
         return false;
     }
 
-    const float Distance = FVector::Dist2D(
-        OwnerPawn->GetActorLocation(),
-        TargetPlanktonActor->GetActorLocation()
-    );
+
+    const float Distance =
+        FVector::Dist2D(
+            OwnerPawn->GetActorLocation(),
+            TargetPlanktonActor->GetActorLocation()
+        );
+
 
     return Distance <= PlanktonReachedDistance;
 }
 
+
 /**
- * 周囲のプランクトンから一番近いものを選んでTargetPlanktonActorに入れる。
+ * 一番近いプランクトンを設定する。
  */
 bool UEnemyAIBrainComponent::SelectNearestPlankton()
 {
-    TargetPlanktonActor = FindNearestPlankton();
+    TargetPlanktonActor =
+        FindNearestPlankton();
+
 
     if (!TargetPlanktonActor)
     {
         return false;
     }
 
-    TargetLocation = TargetPlanktonActor->GetActorLocation();
+
+    TargetLocation =
+        TargetPlanktonActor->GetActorLocation();
+
+
     return true;
 }
 
+
 /**
- * 食べた数に応じてGoToHookへ移行するか判定する。
+ * プランクトン数に応じて、
+ * GoToHookへ行くか確率判定する。
  */
 bool UEnemyAIBrainComponent::TryGoToHookByPlanktonCount()
 {
-    const float Chance = GetGoToHookChanceByPlanktonCount();
+    const float Chance =
+        GetGoToHookChanceByPlanktonCount();
+
 
     if (Chance <= 0.0f)
     {
         return false;
     }
 
+
     return TryChance(Chance);
 }
 
+
 /**
- * 食べた数からGoToHook確率を返す。
+ * プランクトン数からGoToHook確率を返す。
  */
 float UEnemyAIBrainComponent::GetGoToHookChanceByPlanktonCount() const
 {
@@ -1052,32 +2010,36 @@ float UEnemyAIBrainComponent::GetGoToHookChanceByPlanktonCount() const
         return 1.0f;
     }
 
+
     if (EatenPlanktonCount >= 30)
     {
         return 0.5f;
     }
+
 
     if (EatenPlanktonCount >= 20)
     {
         return 0.25f;
     }
 
+
     if (EatenPlanktonCount >= 10)
     {
         return 0.125f;
     }
 
+
     return 0.0f;
 }
 
-// =========================
+
+// =========================================================
 // Attack用関数
-// =========================
+// =========================================================
+
 
 /**
- * 周囲のFishタグ持ちActorから一番近い攻撃対象を探す。
- *
- * SafeZoneタグ持ちActorは除外する。
+ * 一番近い攻撃対象を探す。
  */
 AActor* UEnemyAIBrainComponent::FindNearestAttackTarget() const
 {
@@ -1086,15 +2048,31 @@ AActor* UEnemyAIBrainComponent::FindNearestAttackTarget() const
         return nullptr;
     }
 
-    TArray<AActor*> FishActors;
-    UGameplayStatics::GetAllActorsWithTag(GetWorld(), FishTagName, FishActors);
 
-    const FVector MyLocation = OwnerPawn->GetActorLocation();
+    TArray<AActor*> FishActors;
+
+
+    UGameplayStatics::GetAllActorsWithTag(
+        GetWorld(),
+        FishTagName,
+        FishActors
+    );
+
+
+    const FVector MyLocation =
+        OwnerPawn->GetActorLocation();
+
 
     AActor* NearestTarget = nullptr;
-    float NearestDistanceSq = TNumericLimits<float>::Max();
 
-    const float SearchRadiusSq = AttackSearchRadius * AttackSearchRadius;
+
+    float NearestDistanceSq =
+        TNumericLimits<float>::Max();
+
+
+    const float SearchRadiusSq =
+        AttackSearchRadius * AttackSearchRadius;
+
 
     for (AActor* FishActor : FishActors)
     {
@@ -1103,69 +2081,89 @@ AActor* UEnemyAIBrainComponent::FindNearestAttackTarget() const
             continue;
         }
 
-        const float DistanceSq = FVector::DistSquared2D(
-            MyLocation,
-            FishActor->GetActorLocation()
-        );
+
+        const float DistanceSq =
+            FVector::DistSquared2D(
+                MyLocation,
+                FishActor->GetActorLocation()
+            );
+
 
         if (DistanceSq > SearchRadiusSq)
         {
             continue;
         }
 
+
         if (DistanceSq < NearestDistanceSq)
         {
             NearestDistanceSq = DistanceSq;
+
             NearestTarget = FishActor;
         }
     }
 
+
     return NearestTarget;
 }
 
+
 /**
- * TargetFishActorが有効か確認する。
- *
- * SafeZoneタグ持ちになったActorは無効扱いにする。
+ * 現在の攻撃対象が有効か確認する。
  */
 bool UEnemyAIBrainComponent::IsTargetFishValid() const
 {
     return IsValidAttackCandidate(TargetFishActor);
 }
 
+
 /**
- * 周囲の魚から一番近い攻撃対象を選ぶ。
+ * 一番近い攻撃対象を設定する。
  */
 bool UEnemyAIBrainComponent::SelectNearestAttackTarget()
 {
-    TargetFishActor = FindNearestAttackTarget();
+    TargetFishActor =
+        FindNearestAttackTarget();
+
 
     if (!TargetFishActor)
     {
         return false;
     }
 
-    TargetLocation = TargetFishActor->GetActorLocation();
+
+    TargetLocation =
+        TargetFishActor->GetActorLocation();
+
+
     return true;
 }
 
+
 /**
- * 攻撃可能距離まで近づいているか確認する。
+ * 攻撃開始距離以内か確認する。
  */
 bool UEnemyAIBrainComponent::IsNearAttackTarget() const
 {
-    if (!OwnerPawn || !IsTargetFishValid())
+    if (
+        !OwnerPawn
+        || !IsTargetFishValid()
+    )
     {
         return false;
     }
 
-    const float Distance = FVector::Dist2D(
-        OwnerPawn->GetActorLocation(),
-        TargetFishActor->GetActorLocation()
-    );
+
+    const float Distance =
+        FVector::Dist2D(
+            OwnerPawn->GetActorLocation(),
+            TargetFishActor->GetActorLocation()
+        );
+
 
     return Distance <= AttackRange;
 }
+
 
 /**
  * Attackの仮終了処理。
@@ -1177,13 +2175,43 @@ void UEnemyAIBrainComponent::FinishAttackTemporarily()
         OwnerAIController->StopMovement();
     }
 
+
     TargetFishActor = nullptr;
+
+
+    ReturnFromAttack();
+}
+
+
+/**
+ * Attack終了後の復帰先へ戻る。
+ *
+ * GoToHookからAttackへ入っていた場合：
+ * → GoToHook
+ *
+ * 通常Attack：
+ * → Wander
+ */
+void UEnemyAIBrainComponent::ReturnFromAttack()
+{
+    TargetFishActor = nullptr;
+
+
+    if (bReturnToGoToHookAfterAttack)
+    {
+        SetAIMode(EEnemyAIMode::GoToHook);
+
+        return;
+    }
+
 
     SetAIMode(EEnemyAIMode::Wander);
 }
 
+
 /**
- * Attackモードに入った時に魚種変更する予定の関数。
+ * Attackモードへ入った時、
+ * AIレベルに応じて魚種変更を試す。
  */
 void UEnemyAIBrainComponent::TryChangeFishOnAttackMode()
 {
@@ -1192,69 +2220,93 @@ void UEnemyAIBrainComponent::TryChangeFishOnAttackMode()
         ? StrongFishChangeChance
         : WeakFishChangeChance;
 
+
     if (!TryChance(Chance))
     {
         return;
     }
 
-    // TODO:
-    // ここでBP_PlayerBase側の魚種変更関数を呼ぶ。
-    // 例：
-    // - 強いAIなら高性能魚種へ変更
-    // - 弱いAIなら低確率で変更
-    //
-    // 今はまだ未実装なので何もしない。
+
+    /*
+     * TODO:
+     *
+     * ここでBP_PlayerBase側の魚種変更処理を呼ぶ。
+     *
+     * Strong：
+     * 高性能魚種を優先。
+     *
+     * Weak：
+     * 安価な魚種を優先。
+     */
 }
+
 
 /**
  * 攻撃対象として有効か確認する。
- *
- * falseになる条件：
- * - nullptr
- * - 自分自身
- * - SafeZoneタグ持ちActor
  */
-bool UEnemyAIBrainComponent::IsValidAttackCandidate(AActor* CandidateActor) const
+bool UEnemyAIBrainComponent::IsValidAttackCandidate(
+    AActor* CandidateActor
+) const
 {
-    if (!CandidateActor)
+    if (!IsValid(CandidateActor))
     {
         return false;
     }
+
 
     if (CandidateActor == OwnerPawn)
     {
         return false;
     }
 
-    if (bIgnoreActorsInSafeZone && CandidateActor->ActorHasTag(SafeZoneActorTagName))
+
+    // SafeZone中Actorは攻撃対象にしない。
+    if (
+        bIgnoreActorsInSafeZone
+        && CandidateActor->ActorHasTag(
+            SafeZoneActorTagName
+        )
+    )
     {
         return false;
     }
 
+
     return true;
 }
 
-// =========================
+
+// =========================================================
 // Flee用関数
-// =========================
+// =========================================================
+
 
 /**
  * 逃走元Actorを取得する。
  */
 AActor* UEnemyAIBrainComponent::GetFleeSourceActor() const
 {
-    if (IsValid(LastDamageCauser) && LastDamageCauser != OwnerPawn)
+    if (
+        IsValid(LastDamageCauser)
+        && LastDamageCauser != OwnerPawn
+    )
     {
         return LastDamageCauser;
     }
 
-    if (IsValid(TargetFishActor) && TargetFishActor != OwnerPawn)
+
+    if (
+        IsValid(TargetFishActor)
+        && TargetFishActor != OwnerPawn
+    )
     {
         return TargetFishActor;
     }
 
+
     return nullptr;
 }
+
 
 /**
  * 逃走元から十分離れたか確認する。
@@ -1266,37 +2318,55 @@ bool UEnemyAIBrainComponent::IsFarEnoughFromFleeSource() const
         return true;
     }
 
-    AActor* FleeSourceActor = GetFleeSourceActor();
+
+    AActor* FleeSourceActor =
+        GetFleeSourceActor();
+
 
     if (!FleeSourceActor)
     {
         return true;
     }
 
-    const float EndDistance = FleeEndDistanceCells * CellSize;
 
-    const float Distance = FVector::Dist2D(
-        OwnerPawn->GetActorLocation(),
-        FleeSourceActor->GetActorLocation()
-    );
+    const float EndDistance =
+        FleeEndDistanceCells * CellSize;
+
+
+    const float Distance =
+        FVector::Dist2D(
+            OwnerPawn->GetActorLocation(),
+            FleeSourceActor->GetActorLocation()
+        );
+
 
     return Distance >= EndDistance;
 }
 
+
 /**
- * 指定Actorから遠ざかるようにAルール移動する。
+ * 指定Actorから遠ざかるように
+ * Aルール移動する。
  */
-bool UEnemyAIBrainComponent::MoveByARuleAwayFromActor(AActor* SourceActor)
+bool UEnemyAIBrainComponent::MoveByARuleAwayFromActor(
+    AActor* SourceActor
+)
 {
     if (!OwnerPawn || !SourceActor)
     {
         return false;
     }
 
-    FVector AwayDirection = OwnerPawn->GetActorLocation() - SourceActor->GetActorLocation();
+
+    FVector AwayDirection =
+        OwnerPawn->GetActorLocation()
+        - SourceActor->GetActorLocation();
+
+
     AwayDirection.Z = 0.0f;
 
-    // ほぼ同じ位置にいる場合、離れる方向が作れないのでランダム方向を使う
+
+    // 同じ位置にいる場合はランダム方向。
     if (AwayDirection.IsNearlyZero())
     {
         AwayDirection = FVector(
@@ -1306,36 +2376,393 @@ bool UEnemyAIBrainComponent::MoveByARuleAwayFromActor(AActor* SourceActor)
         );
     }
 
-    AwayDirection = AwayDirection.GetSafeNormal();
 
-    // 逃走用の仮目的地
+    AwayDirection =
+        AwayDirection.GetSafeNormal();
+
+
     const FVector FleeGoalLocation =
         OwnerPawn->GetActorLocation()
-        + AwayDirection * ARuleStepDistance * FleeAwayWeight;
+        + AwayDirection
+        * ARuleStepDistance
+        * FleeAwayWeight;
+
 
     TargetLocation = FleeGoalLocation;
 
-    return MoveByARuleToLocation(FleeGoalLocation);
+
+    return MoveByARuleToLocation(
+        FleeGoalLocation
+    );
 }
 
-// =========================
-// AttackLock用関数
-// =========================
+
+// =========================================================
+// GoToHook用関数
+// =========================================================
+
 
 /**
- * Attackへ移行してよいか確認する。
+ * 強制GoToHook条件を満たしているか確認する。
+ */
+bool UEnemyAIBrainComponent::ShouldForceGoToHook() const
+{
+    return
+        EatenPlanktonCount
+        >= ForceGoToHookPlanktonCount;
+}
+
+
+/**
+ * TargetHookActorが有効か確認する。
+ */
+bool UEnemyAIBrainComponent::IsHookTargetValid() const
+{
+    return IsValid(TargetHookActor);
+}
+
+
+/**
+ * BP側へ、
+ * 現在アクティブなGoal Pointの検索を要求する。
+ */
+void UEnemyAIBrainComponent::RequestActiveHookSearch()
+{
+    AActor* OwnerActor = GetOwner();
+
+
+    if (!OwnerActor || !OwnerActor->HasAuthority())
+    {
+        return;
+    }
+
+
+    /*
+     * BP側へ通知する。
+     *
+     * BP_Enemy側では、
+     *
+     * OnHookSearchRequested
+     * ↓
+     * GameSystem
+     * ↓
+     * Get Active Nearby Goal Point
+     * ↓
+     * 有効Actor
+     * ↓
+     * SetHookTarget
+     *
+     * と接続する。
+     */
+    OnHookSearchRequested.Broadcast();
+
+
+    /*
+     * 次回検索時刻を設定する。
+     *
+     * 全AIが完全に同じタイミングで検索しないように、
+     * Min～Maxの間でランダムにする。
+     */
+    if (GetWorld())
+    {
+        const float WaitTime =
+            FMath::FRandRange(
+                HookSearchIntervalMin,
+                HookSearchIntervalMax
+            );
+
+
+        NextHookSearchTime =
+            GetWorld()->GetTimeSeconds()
+            + WaitTime;
+    }
+}
+
+
+/**
+ * Goal Pointへ十分近いか確認する。
+ */
+bool UEnemyAIBrainComponent::IsNearHook() const
+{
+    if (
+        !OwnerPawn
+        || !IsHookTargetValid()
+    )
+    {
+        return false;
+    }
+
+
+    const float Distance =
+        FVector::Dist2D(
+            OwnerPawn->GetActorLocation(),
+            TargetHookActor->GetActorLocation()
+        );
+
+
+    return Distance <= HookReachedDistance;
+}
+
+
+/**
+ * GoToHook中、
+ * 周囲にいる最も近い攻撃対象を探す。
+ */
+AActor* UEnemyAIBrainComponent::FindNearestGoToHookEnemy() const
+{
+    if (!OwnerPawn)
+    {
+        return nullptr;
+    }
+
+
+    TArray<AActor*> FishActors;
+
+
+    UGameplayStatics::GetAllActorsWithTag(
+        GetWorld(),
+        FishTagName,
+        FishActors
+    );
+
+
+    const FVector MyLocation =
+        OwnerPawn->GetActorLocation();
+
+
+    AActor* NearestEnemy = nullptr;
+
+
+    float NearestDistanceSq =
+        TNumericLimits<float>::Max();
+
+
+    const float DetectDistance =
+        GoToHookEnemyDetectCells * CellSize;
+
+
+    const float DetectDistanceSq =
+        DetectDistance * DetectDistance;
+
+
+    for (AActor* FishActor : FishActors)
+    {
+        if (!IsValidAttackCandidate(FishActor))
+        {
+            continue;
+        }
+
+
+        const float DistanceSq =
+            FVector::DistSquared2D(
+                MyLocation,
+                FishActor->GetActorLocation()
+            );
+
+
+        if (DistanceSq > DetectDistanceSq)
+        {
+            continue;
+        }
+
+
+        if (DistanceSq < NearestDistanceSq)
+        {
+            NearestDistanceSq = DistanceSq;
+
+            NearestEnemy = FishActor;
+        }
+    }
+
+
+    return NearestEnemy;
+}
+
+
+/**
+ * GoToHook中のAttack移行判定。
+ */
+bool UEnemyAIBrainComponent::TryAttackDuringGoToHook()
+{
+    // AttackLock中なら不可。
+    if (!CanEnterAttackMode())
+    {
+        return false;
+    }
+
+
+    // 周囲に魚がいるか確認する。
+    AActor* NearbyEnemy =
+        FindNearestGoToHookEnemy();
+
+
+    if (!NearbyEnemy)
+    {
+        return false;
+    }
+
+
+    // Goal Pointまでの距離からAttack確率を計算。
+    const float AttackChance =
+        CalculateGoToHookAttackChance();
+
+
+    // 0%なら抽選しない。
+    if (AttackChance <= 0.0f)
+    {
+        return false;
+    }
+
+
+    // 確率抽選失敗。
+    if (!TryChance(AttackChance))
+    {
+        return false;
+    }
+
+
+    // 攻撃対象を設定。
+    TargetFishActor = NearbyEnemy;
+
+
+    TargetLocation =
+        NearbyEnemy->GetActorLocation();
+
+
+    /*
+     * SetAIMode内で、
+     *
+     * CurrentMode == GoToHook
+     * &&
+     * NewMode == Attack
+     *
+     * の場合、
+     *
+     * bReturnToGoToHookAfterAttack = true
+     *
+     * にする。
+     */
+    SetAIMode(EEnemyAIMode::Attack);
+
+
+    return CurrentMode == EEnemyAIMode::Attack;
+}
+
+
+/**
+ * GoToHook中のAttack確率を計算する。
+ *
+ * 12セル以上：
+ * → 最大30%
+ *
+ * 12～4セル：
+ * → 線形に低下
+ *
+ * 4セル以内：
+ * → 0%
+ */
+float UEnemyAIBrainComponent::CalculateGoToHookAttackChance() const
+{
+    if (
+        !OwnerPawn
+        || !IsHookTargetValid()
+    )
+    {
+        return 0.0f;
+    }
+
+
+    const float DistanceToHook =
+        FVector::Dist2D(
+            OwnerPawn->GetActorLocation(),
+            TargetHookActor->GetActorLocation()
+        );
+
+
+    const float NoAttackDistance =
+        GoToHookNoAttackDistanceCells
+        * CellSize;
+
+
+    const float MaxAttackDistance =
+        GoToHookMaxAttackDistanceCells
+        * CellSize;
+
+
+    // =====================================================
+    // 4セル以内
+    // 0%
+    // =====================================================
+
+    if (DistanceToHook <= NoAttackDistance)
+    {
+        return 0.0f;
+    }
+
+
+    // =====================================================
+    // 12セル以上
+    // 最大30%
+    // =====================================================
+
+    if (DistanceToHook >= MaxAttackDistance)
+    {
+        return GoToHookMaxAttackChance;
+    }
+
+
+    // =====================================================
+    // 4～12セル
+    // 線形補間
+    // =====================================================
+
+    /*
+     * 4セル地点
+     * → DistanceRate = 0
+     *
+     * 12セル地点
+     * → DistanceRate = 1
+     */
+    const float DistanceRate =
+        FMath::Clamp(
+            (DistanceToHook - NoAttackDistance)
+            /
+            FMath::Max(
+                MaxAttackDistance - NoAttackDistance,
+                KINDA_SMALL_NUMBER
+            ),
+            0.0f,
+            1.0f
+        );
+
+
+    return
+        GoToHookMaxAttackChance
+        * DistanceRate;
+}
+
+
+// =========================================================
+// AttackLock用関数
+// =========================================================
+
+
+/**
+ * Attackへ入れるか確認する。
  */
 bool UEnemyAIBrainComponent::CanEnterAttackMode() const
 {
     return !IsAttackLocked();
 }
 
-// =========================
+
+// =========================================================
 // Aルール関数
-// =========================
+// =========================================================
+
 
 /**
- * 近くにいるFishタグ持ちActorから離れる方向を計算する。
+ * 近くのFishタグActorから離れる方向を計算する。
  */
 FVector UEnemyAIBrainComponent::CalculateAvoidDirection() const
 {
@@ -1344,155 +2771,268 @@ FVector UEnemyAIBrainComponent::CalculateAvoidDirection() const
         return FVector::ZeroVector;
     }
 
+
     TArray<AActor*> FishActors;
-    UGameplayStatics::GetAllActorsWithTag(GetWorld(), FishTagName, FishActors);
 
-    const FVector MyLocation = OwnerPawn->GetActorLocation();
 
-    FVector AvoidDirection = FVector::ZeroVector;
+    UGameplayStatics::GetAllActorsWithTag(
+        GetWorld(),
+        FishTagName,
+        FishActors
+    );
 
-    const float MinSeparationDistance = MinSeparationCells * CellSize;
+
+    const FVector MyLocation =
+        OwnerPawn->GetActorLocation();
+
+
+    FVector AvoidDirection =
+        FVector::ZeroVector;
+
+
+    const float MinSeparationDistance =
+        MinSeparationCells * CellSize;
+
 
     for (AActor* OtherActor : FishActors)
     {
-        if (!OtherActor || OtherActor == OwnerPawn)
+        if (
+            !OtherActor
+            || OtherActor == OwnerPawn
+        )
         {
             continue;
         }
 
-        const FVector OtherLocation = OtherActor->GetActorLocation();
 
-        const float Distance = FVector::Dist2D(MyLocation, OtherLocation);
+        const FVector OtherLocation =
+            OtherActor->GetActorLocation();
+
+
+        const float Distance =
+            FVector::Dist2D(
+                MyLocation,
+                OtherLocation
+            );
+
 
         if (Distance <= KINDA_SMALL_NUMBER)
         {
             continue;
         }
 
+
         if (Distance < MinSeparationDistance)
         {
-            FVector FromOtherToMe = MyLocation - OtherLocation;
+            FVector FromOtherToMe =
+                MyLocation - OtherLocation;
+
+
             FromOtherToMe.Z = 0.0f;
+
+
             FromOtherToMe.Normalize();
 
-            const float Strength = 1.0f - FMath::Clamp(
-                Distance / MinSeparationDistance,
-                0.0f,
-                1.0f
-            );
 
-            AvoidDirection += FromOtherToMe * Strength;
+            const float Strength =
+                1.0f
+                - FMath::Clamp(
+                    Distance / MinSeparationDistance,
+                    0.0f,
+                    1.0f
+                );
+
+
+            AvoidDirection +=
+                FromOtherToMe * Strength;
         }
     }
 
+
     AvoidDirection.Z = 0.0f;
+
+
     return AvoidDirection.GetSafeNormal();
 }
 
+
 /**
- * 目的地へ向かう方向、魚を避ける方向、ランダム方向を合成して、
- * 実際にMoveToする候補地点を作る。
+ * Aルール移動先を計算する。
  */
-FVector UEnemyAIBrainComponent::CalculateARuleMoveLocation(const FVector& GoalLocation)
+FVector UEnemyAIBrainComponent::CalculateARuleMoveLocation(
+    const FVector& GoalLocation
+)
 {
     if (!OwnerPawn)
     {
         return GoalLocation;
     }
 
-    const FVector MyLocation = OwnerPawn->GetActorLocation();
 
-    FVector GoalDirection = GoalLocation - MyLocation;
+    const FVector MyLocation =
+        OwnerPawn->GetActorLocation();
+
+
+    // =====================================================
+    // 目的地方向
+    // =====================================================
+
+    FVector GoalDirection =
+        GoalLocation - MyLocation;
+
+
     GoalDirection.Z = 0.0f;
-    GoalDirection = GoalDirection.GetSafeNormal();
 
-    const FVector AvoidDirection = CalculateAvoidDirection();
 
-    FVector RandomDirection = FVector(
-        FMath::FRandRange(-1.0f, 1.0f),
-        FMath::FRandRange(-1.0f, 1.0f),
-        0.0f
-    ).GetSafeNormal();
+    GoalDirection =
+        GoalDirection.GetSafeNormal();
+
+
+    // =====================================================
+    // 周囲の魚を避ける方向
+    // =====================================================
+
+    const FVector AvoidDirection =
+        CalculateAvoidDirection();
+
+
+    // =====================================================
+    // ランダム方向
+    // =====================================================
+
+    FVector RandomDirection =
+        FVector(
+            FMath::FRandRange(-1.0f, 1.0f),
+            FMath::FRandRange(-1.0f, 1.0f),
+            0.0f
+        ).GetSafeNormal();
+
+
+    // =====================================================
+    // 各方向を合成
+    // =====================================================
 
     FVector FinalDirection =
         GoalDirection * GoalWeight
         + AvoidDirection * AvoidWeight
         + RandomDirection * RandomWeight;
 
+
     FinalDirection.Z = 0.0f;
+
 
     if (FinalDirection.IsNearlyZero())
     {
         FinalDirection = GoalDirection;
     }
 
-    FinalDirection = FinalDirection.GetSafeNormal();
 
-    FVector CandidateLocation = MyLocation + FinalDirection * ARuleStepDistance;
+    FinalDirection =
+        FinalDirection.GetSafeNormal();
 
-    const float DistanceToGoal = FVector::Dist2D(MyLocation, GoalLocation);
 
+    // =====================================================
+    // 候補地点作成
+    // =====================================================
+
+    FVector CandidateLocation =
+        MyLocation
+        + FinalDirection
+        * ARuleStepDistance;
+
+
+    const float DistanceToGoal =
+        FVector::Dist2D(
+            MyLocation,
+            GoalLocation
+        );
+
+
+    /*
+     * 目的地までARuleStepDistance未満なら、
+     * 目的地そのものを候補にする。
+     */
     if (DistanceToGoal < ARuleStepDistance)
     {
         CandidateLocation = GoalLocation;
     }
 
+
     return CandidateLocation;
 }
 
+
 /**
- * Aルール移動。
+ * Aルールで補正した位置へMoveToする。
  */
-bool UEnemyAIBrainComponent::MoveByARuleToLocation(const FVector& GoalLocation)
+bool UEnemyAIBrainComponent::MoveByARuleToLocation(
+    const FVector& GoalLocation
+)
 {
     if (!OwnerPawn || !OwnerAIController)
     {
         return false;
     }
 
-    UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(GetWorld());
+
+    UNavigationSystemV1* NavSys =
+        UNavigationSystemV1::GetCurrent(GetWorld());
+
 
     if (!NavSys)
     {
         return false;
     }
 
-    const FVector CandidateLocation = CalculateARuleMoveLocation(GoalLocation);
+
+    const FVector CandidateLocation =
+        CalculateARuleMoveLocation(GoalLocation);
+
 
     FNavLocation ProjectedLocation;
 
-    const bool bProjected = NavSys->ProjectPointToNavigation(
-        CandidateLocation,
-        ProjectedLocation
-    );
+
+    const bool bProjected =
+        NavSys->ProjectPointToNavigation(
+            CandidateLocation,
+            ProjectedLocation
+        );
+
 
     if (!bProjected)
     {
         return false;
     }
 
+
     OwnerAIController->MoveToLocation(
         ProjectedLocation.Location,
         AcceptanceRadius
     );
 
+
     return true;
 }
 
-// =========================
+
+// =========================================================
 // 汎用関数
-// =========================
+// =========================================================
+
 
 /**
  * 確率判定。
  */
-bool UEnemyAIBrainComponent::TryChance(float Chance) const
+bool UEnemyAIBrainComponent::TryChance(
+    float Chance
+) const
 {
     return FMath::FRand() <= Chance;
 }
 
+
 /**
- * AIが次の判断をしてよい時間か確認する。
+ * 次の判断時間になったか確認する。
  */
 bool UEnemyAIBrainComponent::ShouldMakeDecision() const
 {
@@ -1501,19 +3041,35 @@ bool UEnemyAIBrainComponent::ShouldMakeDecision() const
         return false;
     }
 
-    return GetWorld()->GetTimeSeconds() >= NextDecisionTime;
+
+    return
+        GetWorld()->GetTimeSeconds()
+        >= NextDecisionTime;
 }
 
+
 /**
- * 次の判断時間を設定する。
+ * 次の判断時刻を設定する。
  */
-void UEnemyAIBrainComponent::SetNextDecisionTime(float MinTime, float MaxTime)
+void UEnemyAIBrainComponent::SetNextDecisionTime(
+    float MinTime,
+    float MaxTime
+)
 {
     if (!GetWorld())
     {
         return;
     }
 
-    const float WaitTime = FMath::FRandRange(MinTime, MaxTime);
-    NextDecisionTime = GetWorld()->GetTimeSeconds() + WaitTime;
+
+    const float WaitTime =
+        FMath::FRandRange(
+            MinTime,
+            MaxTime
+        );
+
+
+    NextDecisionTime =
+        GetWorld()->GetTimeSeconds()
+        + WaitTime;
 }
