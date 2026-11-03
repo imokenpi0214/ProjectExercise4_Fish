@@ -7,174 +7,139 @@
 #include "GameFramework/CharacterMovementComponent.h"
 #include "TimerManager.h"
 
-/**
- * AI専用攻撃コンポーネント。
- *
- * 役割：
- * - AI専用のチャージ処理
- * - チャージ後のダッシュ開放
- * - LaunchCharacterによる突進
- * - 突進中だけAttackSphereのCollisionをONにする
- * - 突進終了時にAttackSphereのCollisionをOFFにする
- * - AI攻撃用ダメージを計算する
- * - 必要ならEnemyAIBrainComponentへ攻撃終了通知
- *
- * 今回の流れ：
- * 1. EnemyAIBrainComponentのAttackモードからStartDashAttackを呼ぶ
- * 2. ChargeTime秒だけ待つ
- * 3. ターゲット方向へ向く
- * 4. CurrentDashSpeedを設定
- * 5. CurrentDamageAmountを計算
- * 6. AttackSphereのCollisionをON
- * 7. LaunchCharacterで突進
- * 8. DashDuration秒後にAttackSphereのCollisionをOFF
- * 9. 攻撃終了
- * 10. 必要ならBrainをWanderへ戻す
- */
+
 UEnemyAIAttackComponent::UEnemyAIAttackComponent()
 {
-    // 今回はTimerで処理するのでTickは不要
     PrimaryComponentTick.bCanEverTick = false;
 }
+
 
 void UEnemyAIAttackComponent::BeginPlay()
 {
     Super::BeginPlay();
 
-    // このComponentを持っているActorをCharacterとして保持する
-    // BP_EnemyはBP_PlayerBaseの子なので、Character系である想定
     OwnerCharacter = Cast<ACharacter>(GetOwner());
 
-    // BP側にあるAttackSphereを探す
     FindAttackCollisionComponent();
 
-    // ゲーム開始時は攻撃判定をOFFにしておく
-    // これをしないと、攻撃していない時もOverlapが発生する可能性がある
     if (bDisableAttackCollisionOnBeginPlay)
     {
         SetAttackCollisionEnabled(false);
     }
 
-    // 開始時点ではダメージなし
     CurrentDashSpeed = 0.0f;
     CurrentDamageAmount = 0.0f;
 }
 
-// =========================
-// BP / Brain から呼ぶ公開関数
-// =========================
 
-/**
- * AI用ダッシュ攻撃を開始する。
- *
- * Brain側のAttackモードから呼ばれる想定。
- */
-bool UEnemyAIAttackComponent::StartDashAttack(AActor* TargetActor)
+// =========================================================
+// 公開関数
+// =========================================================
+
+bool UEnemyAIAttackComponent::StartDashAttack(
+    AActor* TargetActor
+)
 {
     AActor* OwnerActor = GetOwner();
 
-    // AI攻撃はサーバー側だけで開始する
-    // クライアント側で開始すると同期ズレの原因になる
     if (!OwnerActor || !OwnerActor->HasAuthority())
     {
         return false;
     }
 
-    // BeginPlay時に取れていなかった場合の保険
+
     if (!OwnerCharacter)
     {
-        OwnerCharacter = Cast<ACharacter>(OwnerActor);
+        OwnerCharacter =
+            Cast<ACharacter>(OwnerActor);
     }
+
 
     if (!OwnerCharacter)
     {
         return false;
     }
 
-    if (!TargetActor)
+    if (
+        !bUseCurrentForwardForDash
+        && !IsValid(TargetActor)
+    )
     {
         return false;
     }
 
-    // すでにチャージ中・ダッシュ中なら開始しない
+    /*
+     * =========================================================
+     * ここが今回の変更点
+     * =========================================================
+     *
+     * TargetActor == nullptr でも許可する。
+     *
+     * bUseCurrentForwardForDash == true なら、
+     * ターゲットがなくても現在のForward方向へダッシュできる。
+     *
+     * 通常攻撃：
+     * StartDashAttack(TargetFishActor)
+     *
+     * 移動・逃走など：
+     * StartDashAttack(nullptr)
+     */
+
+
     if (bIsAttacking)
     {
         return false;
     }
 
+
     CurrentTargetActor = TargetActor;
+
 
     bIsAttacking = true;
     bIsCharging = true;
     bIsDashing = false;
 
-    // チャージ開始時点ではまだダッシュしていないので速度とダメージは0
+
     CurrentDashSpeed = 0.0f;
     CurrentDamageAmount = 0.0f;
 
-    // チャージ中はまだ攻撃判定を出さない
-    // つまり、チャージしているだけでは相手に当たらない
+
+    // チャージ中は攻撃判定OFF
     SetAttackCollisionEnabled(false);
 
-    // 既存タイマーを念のためクリア
+
     if (GetWorld())
     {
-        GetWorld()->GetTimerManager().ClearTimer(ChargeTimerHandle);
-        GetWorld()->GetTimerManager().ClearTimer(DashTimerHandle);
+        GetWorld()
+            ->GetTimerManager()
+            .ClearTimer(
+                ChargeTimerHandle
+            );
 
-        // ChargeTime秒後にダッシュ開放
-        GetWorld()->GetTimerManager().SetTimer(
-            ChargeTimerHandle,
-            this,
-            &UEnemyAIAttackComponent::ReleaseDashAttack,
-            ChargeTime,
-            false
-        );
+
+        GetWorld()
+            ->GetTimerManager()
+            .ClearTimer(
+                DashTimerHandle
+            );
+
+
+        GetWorld()
+            ->GetTimerManager()
+            .SetTimer(
+                ChargeTimerHandle,
+                this,
+                &UEnemyAIAttackComponent::ReleaseDashAttack,
+                ChargeTime,
+                false
+            );
     }
+
 
     return true;
 }
 
-/**
- * チャージ中またはダッシュ中ならtrue。
- */
-bool UEnemyAIAttackComponent::IsAttacking() const
-{
-    return bIsAttacking;
-}
 
-/**
- * チャージ中ならtrue。
- */
-bool UEnemyAIAttackComponent::IsCharging() const
-{
-    return bIsCharging;
-}
-
-/**
- * ダッシュ中ならtrue。
- */
-bool UEnemyAIAttackComponent::IsDashing() const
-{
-    return bIsDashing;
-}
-
-/**
- * 現在のAI攻撃ダメージ量を返す。
- *
- * BPのAttackSphere BeginOverlap内で呼び、
- * BPI_Player Apply Damage に渡す。
- */
-float UEnemyAIAttackComponent::GetCurrentDamageAmount() const
-{
-    return CurrentDamageAmount;
-}
-
-/**
- * 攻撃を強制終了する。
- *
- * 死亡時、モード強制変更時、デバッグ時などに使う。
- */
 void UEnemyAIAttackComponent::CancelDashAttack()
 {
     if (GetWorld())
@@ -183,7 +148,6 @@ void UEnemyAIAttackComponent::CancelDashAttack()
         GetWorld()->GetTimerManager().ClearTimer(DashTimerHandle);
     }
 
-    // 強制終了時も攻撃判定をOFFにする
     SetAttackCollisionEnabled(false);
 
     bIsAttacking = false;
@@ -192,30 +156,63 @@ void UEnemyAIAttackComponent::CancelDashAttack()
 
     CurrentTargetActor = nullptr;
 
-    // 強制終了時は速度とダメージをリセット
     CurrentDashSpeed = 0.0f;
     CurrentDamageAmount = 0.0f;
 
     SetOwnerMaxWalkSpeed(NormalMoveSpeed);
 
-    if (bStopVelocityOnFinish)
+    if (OwnerCharacter)
     {
-        StopOwnerVelocity();
-    }
+        UCharacterMovementComponent* MoveComp =
+            OwnerCharacter->GetCharacterMovement();
 
-    if (bStopAIMovementOnFinish)
-    {
-        StopAIMovement();
+        if (MoveComp && bStopVelocityOnFinish)
+        {
+            MoveComp->Velocity = FVector::ZeroVector;
+        }
+
+        if (bStopAIMovementOnFinish)
+        {
+            AAIController* AIController =
+                Cast<AAIController>(OwnerCharacter->GetController());
+
+            if (AIController)
+            {
+                AIController->StopMovement();
+            }
+        }
     }
 }
 
-// =========================
-// 内部処理
-// =========================
 
-/**
- * チャージ終了後、ダッシュを開放する。
- */
+bool UEnemyAIAttackComponent::IsAttacking() const
+{
+    return bIsAttacking;
+}
+
+
+bool UEnemyAIAttackComponent::IsCharging() const
+{
+    return bIsCharging;
+}
+
+
+bool UEnemyAIAttackComponent::IsDashing() const
+{
+    return bIsDashing;
+}
+
+
+float UEnemyAIAttackComponent::GetCurrentDamageAmount() const
+{
+    return CurrentDamageAmount;
+}
+
+
+// =========================================================
+// 内部処理
+// =========================================================
+
 void UEnemyAIAttackComponent::ReleaseDashAttack()
 {
     AActor* OwnerActor = GetOwner();
@@ -226,10 +223,13 @@ void UEnemyAIAttackComponent::ReleaseDashAttack()
         return;
     }
 
+
     if (!OwnerCharacter)
     {
-        OwnerCharacter = Cast<ACharacter>(OwnerActor);
+        OwnerCharacter =
+            Cast<ACharacter>(OwnerActor);
     }
+
 
     if (!OwnerCharacter)
     {
@@ -237,23 +237,58 @@ void UEnemyAIAttackComponent::ReleaseDashAttack()
         return;
     }
 
-    if (!CurrentTargetActor)
-    {
-        CancelDashAttack();
-        return;
-    }
+
+    /*
+     * =========================================================
+     * 以前はここに
+     *
+     * if (!CurrentTargetActor)
+     * {
+     *     CancelDashAttack();
+     *     return;
+     * }
+     *
+     * があった。
+     *
+     * 今回は削除する。
+     *
+     * bUseCurrentForwardForDash == true なら、
+     * CurrentTargetActorがnullptrでも
+     * 現在のForward方向へダッシュできるため。
+     * =========================================================
+     */
+
 
     bIsCharging = false;
     bIsDashing = true;
 
-    // ダッシュ直前にAIのMoveToを止める
-    // これをしないと、WanderやAttack接近中の移動方向が残って横突進になりやすい
+
+    // =========================================================
+    // AIの通常移動を止める
+    // =========================================================
+
     if (bStopAIMovementBeforeDash)
     {
-        StopAIMovement();
+        AAIController* AIController =
+            Cast<AAIController>(
+                OwnerCharacter->GetController()
+            );
+
+
+        if (AIController)
+        {
+            AIController->StopMovement();
+        }
     }
 
-    const FVector DashDirection = CalculateDashDirection();
+
+    // =========================================================
+    // ダッシュ方向取得
+    // =========================================================
+
+    const FVector DashDirection =
+        GetDashDirection();
+
 
     if (DashDirection.IsNearlyZero())
     {
@@ -261,63 +296,111 @@ void UEnemyAIAttackComponent::ReleaseDashAttack()
         return;
     }
 
-    // ダッシュ前にターゲット方向へ向く
+
+    // =========================================================
+    // 必要ならターゲット方向へ向く
+    //
+    // 現在の設定：
+    // bFaceTargetBeforeDash = false
+    //
+    // なので通常はここでは向きを変更しない。
+    // =========================================================
+
     if (bFaceTargetBeforeDash)
     {
-        FaceToDashDirection(DashDirection);
+        FRotator NewRotation =
+            DashDirection.Rotation();
+
+
+        NewRotation.Pitch = 0.0f;
+        NewRotation.Roll = 0.0f;
+
+
+        OwnerCharacter->SetActorRotation(
+            NewRotation
+        );
+
+
+        if (bSetControllerRotationBeforeDash)
+        {
+            AController* Controller =
+                OwnerCharacter->GetController();
+
+
+            if (Controller)
+            {
+                Controller->SetControlRotation(
+                    NewRotation
+                );
+            }
+        }
     }
 
-    // プレイヤー側ADashに近づけるため、ダッシュ中のMaxWalkSpeedを上げる
-    SetOwnerMaxWalkSpeed(DashMoveSpeed);
 
-    // AIは基本最大チャージ扱い。
-    // そのため、現在ダッシュ速度は最大速度として扱う。
-    //
-    // 後で「弱いAIは溜めが浅い」などを入れる場合は、
-    // ここを CurrentDashSpeed = MaxDashSpeed * ChargeRate; のように変える。
-    CurrentDashSpeed = MaxDashSpeed;
+    // =========================================================
+    // ダッシュ速度設定
+    // =========================================================
 
-    // ダメージ量を計算する。
-    //
-    // 式：
-    // CurrentDamageAmount = MaximumAttackPower * Clamp(CurrentDashSpeed / MaxDashSpeed, 0.0f, 1.0f)
+    SetOwnerMaxWalkSpeed(
+        DashMoveSpeed
+    );
+
+
+    CurrentDashSpeed =
+        MaxDashSpeed;
+
+
     CalculateCurrentDamageAmount();
 
-    // ダッシュ中だけ攻撃判定をONにする
-    // 既存のAttackSphere BeginOverlap処理があるなら、このタイミングで発火可能になる
-    if (bUseAttackCollisionDuringDash)
-    {
-        SetAttackCollisionEnabled(true);
-    }
 
-    // 地上移動想定なのでZは使わず、XY方向へ突進する
+    // =========================================================
+    // ダッシュ中は必ずAttackSphere ON
+    // =========================================================
+
+    SetAttackCollisionEnabled(
+        true
+    );
+
+
+    // =========================================================
+    // 既存ダッシュ
+    // =========================================================
+
     OwnerCharacter->LaunchCharacter(
         DashDirection * DashPower,
         true,
         false
     );
 
+
+    // =========================================================
+    // ダッシュ終了タイマー
+    // =========================================================
+
     if (GetWorld())
     {
-        GetWorld()->GetTimerManager().ClearTimer(DashTimerHandle);
+        GetWorld()
+            ->GetTimerManager()
+            .ClearTimer(
+                DashTimerHandle
+            );
 
-        // DashDuration秒後に攻撃終了
-        GetWorld()->GetTimerManager().SetTimer(
-            DashTimerHandle,
-            this,
-            &UEnemyAIAttackComponent::FinishDashAttack,
-            DashDuration,
-            false
-        );
+
+        GetWorld()
+            ->GetTimerManager()
+            .SetTimer(
+                DashTimerHandle,
+                this,
+                &UEnemyAIAttackComponent::FinishDashAttack,
+                DashDuration,
+                false
+            );
     }
 }
 
-/**
- * ダッシュ攻撃を終了する。
- */
+
 void UEnemyAIAttackComponent::FinishDashAttack()
 {
-    // ダッシュ終了なので攻撃判定をOFFにする
     SetAttackCollisionEnabled(false);
 
     bIsAttacking = false;
@@ -326,187 +409,51 @@ void UEnemyAIAttackComponent::FinishDashAttack()
 
     CurrentTargetActor = nullptr;
 
-    // ダッシュ速度は終了したので0へ戻す
-    // CurrentDamageAmountはデバッグしやすいように残してもよいが、
-    // 攻撃していない時に誤って読まれないよう、ここでは0へ戻す。
     CurrentDashSpeed = 0.0f;
     CurrentDamageAmount = 0.0f;
 
-    // 通常速度へ戻す
     SetOwnerMaxWalkSpeed(NormalMoveSpeed);
 
-    // 終了時に速度を止める
-    if (bStopVelocityOnFinish)
+    if (OwnerCharacter)
     {
-        StopOwnerVelocity();
+        UCharacterMovementComponent* MoveComp =
+            OwnerCharacter->GetCharacterMovement();
+
+        if (MoveComp && bStopVelocityOnFinish)
+        {
+            MoveComp->Velocity = FVector::ZeroVector;
+        }
+
+        if (bStopAIMovementOnFinish)
+        {
+            AAIController* AIController =
+                Cast<AAIController>(OwnerCharacter->GetController());
+
+            if (AIController)
+            {
+                AIController->StopMovement();
+            }
+        }
     }
 
-    // AIControllerの移動も止める
-    if (bStopAIMovementOnFinish)
-    {
-        StopAIMovement();
-    }
-
-    // 今回は簡易的に、攻撃終了後Wanderへ戻す
-    // 後で「HP80%以上ならAttack継続」などを入れる時はここを調整する
     if (bReturnToWanderOnFinish)
     {
-        NotifyBrainAttackFinished();
-    }
-}
+        AActor* OwnerActor = GetOwner();
 
-/**
- * 現在のターゲット方向を計算する。
- */
-FVector UEnemyAIAttackComponent::CalculateDashDirection() const
-{
-    if (!OwnerCharacter || !CurrentTargetActor)
-    {
-        return FVector::ZeroVector;
-    }
-
-    FVector Direction = CurrentTargetActor->GetActorLocation() - OwnerCharacter->GetActorLocation();
-
-    // 水中風でも実体は地上移動なのでZは消す
-    Direction.Z = 0.0f;
-
-    return Direction.GetSafeNormal();
-}
-
-/**
- * ターゲット方向へOwnerの向きを合わせる。
- */
-void UEnemyAIAttackComponent::FaceToDashDirection(const FVector& DashDirection)
-{
-    if (!OwnerCharacter)
-    {
-        return;
-    }
-
-    if (DashDirection.IsNearlyZero())
-    {
-        return;
-    }
-
-    FRotator NewRotation = DashDirection.Rotation();
-
-    // 地上移動なのでPitch/Rollは使わない
-    NewRotation.Pitch = 0.0f;
-    NewRotation.Roll = 0.0f;
-
-    // Actor本体を向ける
-    OwnerCharacter->SetActorRotation(NewRotation);
-
-    // Controllerの向きも合わせる
-    // CharacterMovementやAIControllerが向きを上書きする対策
-    if (bSetControllerRotationBeforeDash)
-    {
-        AController* Controller = OwnerCharacter->GetController();
-
-        if (Controller)
+        if (OwnerActor && OwnerActor->HasAuthority())
         {
-            Controller->SetControlRotation(NewRotation);
+            UEnemyAIBrainComponent* BrainComponent =
+                OwnerActor->FindComponentByClass<UEnemyAIBrainComponent>();
+
+            if (BrainComponent)
+            {
+                BrainComponent->SetAIMode(EEnemyAIMode::Wander);
+            }
         }
     }
 }
 
-/**
- * CharacterMovementのMaxWalkSpeedを変更する。
- */
-void UEnemyAIAttackComponent::SetOwnerMaxWalkSpeed(float NewSpeed)
-{
-    if (!OwnerCharacter)
-    {
-        return;
-    }
 
-    UCharacterMovementComponent* MoveComp = OwnerCharacter->GetCharacterMovement();
-
-    if (!MoveComp)
-    {
-        return;
-    }
-
-    MoveComp->MaxWalkSpeed = NewSpeed;
-}
-
-/**
- * OwnerのVelocityを止める。
- */
-void UEnemyAIAttackComponent::StopOwnerVelocity()
-{
-    if (!OwnerCharacter)
-    {
-        return;
-    }
-
-    UCharacterMovementComponent* MoveComp = OwnerCharacter->GetCharacterMovement();
-
-    if (!MoveComp)
-    {
-        return;
-    }
-
-    MoveComp->Velocity = FVector::ZeroVector;
-}
-
-/**
- * AIControllerのMoveToを止める。
- */
-void UEnemyAIAttackComponent::StopAIMovement()
-{
-    if (!OwnerCharacter)
-    {
-        return;
-    }
-
-    AController* Controller = OwnerCharacter->GetController();
-
-    AAIController* AIController = Cast<AAIController>(Controller);
-
-    if (!AIController)
-    {
-        return;
-    }
-
-    AIController->StopMovement();
-}
-
-/**
- * ダッシュ終了後にBrainへ通知する。
- *
- * 今回は簡易的にWanderへ戻す。
- */
-void UEnemyAIAttackComponent::NotifyBrainAttackFinished()
-{
-    AActor* OwnerActor = GetOwner();
-
-    if (!OwnerActor || !OwnerActor->HasAuthority())
-    {
-        return;
-    }
-
-    UEnemyAIBrainComponent* BrainComponent =
-        OwnerActor->FindComponentByClass<UEnemyAIBrainComponent>();
-
-    if (!BrainComponent)
-    {
-        return;
-    }
-
-    BrainComponent->SetAIMode(EEnemyAIMode::Wander);
-}
-
-/**
- * BP_Enemy / BP_PlayerBaseについているAttackSphereを探す。
- *
- * BPイベントは使わない。
- * C++からComponent名で直接探す。
- *
- * 注意：
- * - BP側のComponent名と AttackCollisionComponentName が一致している必要がある
- * - 例：BP側が AttackSphere なら、AttackCollisionComponentName も AttackSphere
- */
 void UEnemyAIAttackComponent::FindAttackCollisionComponent()
 {
     AttackCollisionComponent = nullptr;
@@ -519,7 +466,10 @@ void UEnemyAIAttackComponent::FindAttackCollisionComponent()
     }
 
     TArray<UPrimitiveComponent*> PrimitiveComponents;
-    OwnerActor->GetComponents<UPrimitiveComponent>(PrimitiveComponents);
+
+    OwnerActor->GetComponents<UPrimitiveComponent>(
+        PrimitiveComponents
+    );
 
     for (UPrimitiveComponent* PrimitiveComponent : PrimitiveComponents)
     {
@@ -528,7 +478,6 @@ void UEnemyAIAttackComponent::FindAttackCollisionComponent()
             continue;
         }
 
-        // Component名が一致するものをAttackSphereとして扱う
         if (PrimitiveComponent->GetFName() == AttackCollisionComponentName)
         {
             AttackCollisionComponent = PrimitiveComponent;
@@ -537,24 +486,11 @@ void UEnemyAIAttackComponent::FindAttackCollisionComponent()
     }
 }
 
-/**
- * AttackSphereのCollisionをON/OFFする。
- *
- * ON：
- * - CollisionEnabled = QueryOnly
- * - GenerateOverlapEvents = true
- *
- * OFF：
- * - GenerateOverlapEvents = false
- * - CollisionEnabled = NoCollision
- *
- * これにより、
- * - 攻撃していない時はOverlapしない
- * - 突進中だけOverlapする
- */
-void UEnemyAIAttackComponent::SetAttackCollisionEnabled(bool bEnabled)
+
+void UEnemyAIAttackComponent::SetAttackCollisionEnabled(
+    bool bEnabled
+)
 {
-    // まだ見つかっていなければ探す
     if (!AttackCollisionComponent)
     {
         FindAttackCollisionComponent();
@@ -567,30 +503,85 @@ void UEnemyAIAttackComponent::SetAttackCollisionEnabled(bool bEnabled)
 
     if (bEnabled)
     {
-        // Overlap判定だけ欲しいのでQueryOnly
-        AttackCollisionComponent->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+        AttackCollisionComponent->SetCollisionEnabled(
+            ECollisionEnabled::QueryOnly
+        );
+
         AttackCollisionComponent->SetGenerateOverlapEvents(true);
     }
     else
     {
-        // 攻撃していない時は完全に判定OFF
         AttackCollisionComponent->SetGenerateOverlapEvents(false);
-        AttackCollisionComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+
+        AttackCollisionComponent->SetCollisionEnabled(
+            ECollisionEnabled::NoCollision
+        );
     }
 }
 
-/**
- * 現在のダッシュ速度からダメージ量を計算する。
- *
- * 式：
- * CurrentDamageAmount = MaximumAttackPower * Clamp(CurrentDashSpeed / MaxDashSpeed, 0.0f, 1.0f)
- *
- * AIは基本最大チャージなので、
- * CurrentDashSpeed = MaxDashSpeed
- * ↓
- * CurrentDamageAmount = MaximumAttackPower
- * になる。
- */
+
+void UEnemyAIAttackComponent::SetOwnerMaxWalkSpeed(
+    float NewSpeed
+)
+{
+    if (!OwnerCharacter)
+    {
+        return;
+    }
+
+    UCharacterMovementComponent* MoveComp =
+        OwnerCharacter->GetCharacterMovement();
+
+    if (!MoveComp)
+    {
+        return;
+    }
+
+    MoveComp->MaxWalkSpeed = NewSpeed;
+}
+
+
+FVector UEnemyAIAttackComponent::GetDashDirection() const
+{
+    if (!OwnerCharacter)
+    {
+        return FVector::ZeroVector;
+    }
+
+    /*
+     * 今回の推奨設定。
+     *
+     * true：
+     * 現在向いているForward方向へ突進する。
+     *
+     * false：
+     * ターゲット方向へ突進する。
+     */
+    if (bUseCurrentForwardForDash)
+    {
+        FVector ForwardDirection =
+            OwnerCharacter->GetActorForwardVector();
+
+        ForwardDirection.Z = 0.0f;
+
+        return ForwardDirection.GetSafeNormal();
+    }
+
+    if (!CurrentTargetActor)
+    {
+        return FVector::ZeroVector;
+    }
+
+    FVector Direction =
+        CurrentTargetActor->GetActorLocation()
+        - OwnerCharacter->GetActorLocation();
+
+    Direction.Z = 0.0f;
+
+    return Direction.GetSafeNormal();
+}
+
+
 void UEnemyAIAttackComponent::CalculateCurrentDamageAmount()
 {
     if (MaxDashSpeed <= KINDA_SMALL_NUMBER)
@@ -599,11 +590,13 @@ void UEnemyAIAttackComponent::CalculateCurrentDamageAmount()
         return;
     }
 
-    const float AttackRate = FMath::Clamp(
-        CurrentDashSpeed / MaxDashSpeed,
-        0.0f,
-        1.0f
-    );
+    const float AttackRate =
+        FMath::Clamp(
+            CurrentDashSpeed / MaxDashSpeed,
+            0.0f,
+            1.0f
+        );
 
-    CurrentDamageAmount = MaximumAttackPower * AttackRate;
+    CurrentDamageAmount =
+        MaximumAttackPower * AttackRate;
 }
